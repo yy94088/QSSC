@@ -1,0 +1,15 @@
+/home/wangchichu/SubgraphMatching/build/CMakeFiles/edit_cache.dir
+/home/wangchichu/SubgraphMatching/build/CMakeFiles/rebuild_cache.dir
+/home/wangchichu/SubgraphMatching/build/graph/CMakeFiles/graph.dir
+/home/wangchichu/SubgraphMatching/build/graph/CMakeFiles/edit_cache.dir
+/home/wangchichu/SubgraphMatching/build/graph/CMakeFiles/rebuild_cache.dir
+/home/wangchichu/SubgraphMatching/build/matching/CMakeFiles/SubgraphMatching.out.dir
+/home/wangchichu/SubgraphMatching/build/matching/CMakeFiles/GraphConverter.out.dir
+/home/wangchichu/SubgraphMatching/build/matching/CMakeFiles/EdgeListConverter.out.dir
+/home/wangchichu/SubgraphMatching/build/matching/CMakeFiles/ReassignLabel.dir
+/home/wangchichu/SubgraphMatching/build/matching/CMakeFiles/SelectEdge.dir
+/home/wangchichu/SubgraphMatching/build/matching/CMakeFiles/edit_cache.dir
+/home/wangchichu/SubgraphMatching/build/matching/CMakeFiles/rebuild_cache.dir
+/home/wangchichu/SubgraphMatching/build/utility/CMakeFiles/utility.dir
+/home/wangchichu/SubgraphMatching/build/utility/CMakeFiles/edit_cache.dir
+/home/wangchichu/SubgraphMatching/build/utility/CMakeFiles/rebuild_cache.dir
