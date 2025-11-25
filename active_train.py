@@ -3,7 +3,7 @@ from Queryset import Queryset
 from QuerySampler import QueryDecompose
 import torch.optim as optim
 import torch
-from active import ActiveLearner, _to_datasets, print_eval_res, data_split_cv, save_eval_res
+from active import ActiveLearner, _to_datasets, print_eval_res, data_split_cv
 import cardnet
 import os
 from util import model_checkpoint, load_model
@@ -21,7 +21,6 @@ def main(args):
 	dataset = args.dataset
 	data_dir = args.data_dir
 	num_classes = args.max_classes
-	teacher_model_path = args.teacher_model_path
 	pattern = args.pattern
 
 	# optimizer parameter
@@ -31,7 +30,7 @@ def main(args):
 
 
 
-	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern=pattern, teacher_model_path=teacher_model_path, k=args.k, size=args.size)
+	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern=pattern, k=args.k, size=args.size)
 	# decompose the query
 	if args.use_parallel:
 		print(f"Using parallel processing for query decomposition with {args.num_workers} workers...")
@@ -89,7 +88,6 @@ def ensemble_learn(args):
 	true_card_dir = args.true_card_dir
 	dataset = args.dataset
 	data_dir = args.data_dir
-	teacher_model_path = args.teacher_model_path
 	pattern = args.pattern
 
 	# optimizer parameter
@@ -98,7 +96,7 @@ def ensemble_learn(args):
 	decay_factor = args.decay_factor
 
 
-	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern=pattern, teacher_model_path=teacher_model_path, k=args.k, size=args.size)
+	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern=pattern, k=args.k, size=args.size)
 	# decompose the query
 	if args.use_parallel:
 		print(f"Using parallel processing for query decomposition with {args.num_workers} workers...")
@@ -142,7 +140,6 @@ def cross_validate(args):
 	true_card_dir = args.true_card_dir
 	dataset = args.dataset
 	num_classes = args.max_classes
-	teacher_model_path = args.teacher_model_path
 	pattern = args.pattern
 
 	# optimizer parameter
@@ -150,7 +147,7 @@ def cross_validate(args):
 	weight_decay = args.weight_decay
 	decay_factor = args.decay_factor
 
-	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern=pattern, teacher_model_path=teacher_model_path, k=args.k, size=args.size)
+	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern=pattern, k=args.k, size=args.size)
 	# decompose the query
 	if args.use_parallel:
 		print(f"Using parallel processing for query decomposition with {args.num_workers} workers...")
@@ -183,7 +180,7 @@ def cross_validate(args):
 		scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_factor)
 		_, fold_elapse_time = active_learner.train(model=model, criterion=criterion, criterion_cal=criterion_cla,
 									train_datasets=train_datasets, val_datasets=val_datasets,
-									optimizer=optimizer, scheduler=scheduler, active=False)
+									optimizer=optimizer, scheduler=scheduler, active=True)
 		total_elapse_time += fold_elapse_time
 		fold_eval_res = active_learner.evaluate(model=model, criterion=criterion, eval_datasets=val_datasets)
 		# merge the result of the evaluation result of each fold
@@ -202,6 +199,9 @@ def cross_validate(args):
 	print("the total evaluation result:")
 	error_median = print_eval_res(all_fold_val_res, print_details=False)
 	print("error_median={}".format(0 - error_median))
+	
+	# 添加save_eval_res函数的定义
+	from active.active_util import save_eval_res
 	save_eval_res(args, sorted(all_sizes.keys()), all_fold_val_res, args.save_res_dir)
 
 
@@ -210,8 +210,8 @@ if __name__ == "__main__":
 	# Model Settings (ONLY FOR CardNet MODEL)
 	parser.add_argument("--num_layers", default=3, type=int,
 						help="number of convolutional layers")
-	parser.add_argument("--model_type", default="NNGINConcat", type=str,
-						help="GNN layer type") # GIN, GINE, GAT, NN, GCN, SAGE, NNGIN, NNGINConcat
+	parser.add_argument("--model_type", default="NNGINETransformer", type=str,
+						help="GNN layer type") # GIN, GINE, GAT, NN, GCN, SAGE, NNGIN, NNGINConcat, NNGINETransformer
 	parser.add_argument("--embed_type", default="prone", type=str,
 						help="the node feature encoding type") # freq, n2v, prone, n2v_concat, prone_concat, nrp are tested
 	parser.add_argument("--edge_embed_type", default="prone", type=str,
@@ -232,12 +232,21 @@ if __name__ == "__main__":
 						help='shards pooling layer type')
 	parser.add_argument('--dropout', type=float, default=0.2,
 						help='Dropout rate (1 - keep probability).')
+	parser.add_argument('--memory_size', type=int, default=20,
+						help='Size of the query memory bank. 0 means disabled.')
+	parser.add_argument('--similarity_threshold', type=float, default=0.7,
+						help='Similarity threshold for memory retrieval and update.')
+	# High error query logging settings
+	parser.add_argument('--log_high_error', action='store_true',
+						help='Enable logging of high error queries')
+	parser.add_argument('--high_error_threshold', type=float, default=1.0,
+						help='Threshold for defining high error queries (in log scale)')
 	# Training settings
 	parser.add_argument("--cumulative", default=False, type=bool,
 						help='Whether or not to enable cumulative learning')
 	parser.add_argument("--num_fold", default=5, type=int,
 						help="number of fold for cross validation")
-	parser.add_argument("--epochs", default=100, type=int)
+	parser.add_argument("--epochs", default=30, type=int)
 	parser.add_argument("--batch_size", default= 10, type=int)
 	parser.add_argument("--learning_rate", default= 1e-4, type=float)
 	parser.add_argument('--weight_decay', type=float, default=5e-4,
@@ -257,18 +266,20 @@ if __name__ == "__main__":
 						help="enable/disable card classification task.")
 	parser.add_argument("--max_classes", default=10, type=int,
 						help="number classes for the card classification task.")
-	parser.add_argument('--coeff', type=float, default=0.5,
+	parser.add_argument('--coeff', type=float, default=0.3,
 						help='coefficient for the classification loss.')
 	parser.add_argument("--pattern", type=str, default='query',
 					help="Specific pattern_size to load (e.g., query_4 query_8)")
 	parser.add_argument("--size", type=int, default=8)
-	parser.add_argument("--distill_alpha", type=float, default=0.5)
+	parser.add_argument("--distill_alpha", type=float, default=0)
+	parser.add_argument("--distill_kl_alpha", type=float, default=0)
+	parser.add_argument("--distill_kl_bins", type=int, default=10)
 	# Active Learner settings
 	parser.add_argument("--uncertainty", default="consist", type=str,
 						help="The uncertainty type") # entropy, margin, confident, consist, random are tested
 	parser.add_argument("--biased_sample", default=True, type=bool,
 						help="Enable Biased sampling for test set selection")
-	parser.add_argument('--active_iters', type=int, default=2,
+	parser.add_argument('--active_iters', type=int, default=5,
 						help='Num of iterators of active learning.')
 	parser.add_argument('--budget', type=int, default=50,
 						help='Selected Queries budget Per Iteration.')
@@ -281,6 +292,13 @@ if __name__ == "__main__":
 						help='Weight for the contrastive loss.')
 	parser.add_argument('--cardinality_threshold', type=float, default=1.5,
 						help='Cardinality threshold for defining positive pairs in contrastive loss (log scale).')
+	# Similarity Search and Refinement settings
+	parser.add_argument('--use_refinement', action='store_true', default=True,
+						help='Enable the refinement network.')
+	parser.add_argument('--similarity_k', type=int, default=3,
+						help='Number of nearest neighbors to use for refinement.')
+	parser.add_argument('--similarity_threshold', type=float, default=0.9,
+						help='Cosine similarity threshold for finding similar queries.')
 	# Input and Output directory
 	parser.add_argument("--dataset", type=str, default="dblp")  # aids, wordnet, yeast, hprd, youtube, eu2005 are tested
 	parser.add_argument("--full_data_dir", type=str, default="./data/")
@@ -319,7 +337,6 @@ if __name__ == "__main__":
 	args.active_iters = 0 if args.mode == "pretrain" else args.active_iters
 	args.queryset_dir = args.queryset_homo_dir if args.matching == "homo" else  args.queryset_iso_dir
 	args.true_card_dir = args.true_homo_dir if args.matching == "homo" else args.true_iso_dir
-	args.teacher_model_path = os.path.join("FlowSC_model", args.dataset, "FlowSC_model_"+str(args.size)+".pt")
 
 
 

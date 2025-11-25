@@ -34,12 +34,26 @@ class ContrastiveLoss(nn.Module):
         batch_size = embeddings.size(0)
         if batch_size <= 1:
             return torch.tensor(0.0, device=embeddings.device)
+        
+        # 检查输入是否包含NaN或inf
+        if torch.isnan(embeddings).any() or torch.isinf(embeddings).any():
+            return torch.tensor(0.0, device=embeddings.device)
+        
+        if torch.isnan(cardinalities).any() or torch.isinf(cardinalities).any():
+            return torch.tensor(0.0, device=embeddings.device)
 
         # 归一化嵌入向量
         embeddings_norm = F.normalize(embeddings, p=2, dim=1)
         
+        # 检查归一化后是否包含NaN
+        if torch.isnan(embeddings_norm).any():
+            return torch.tensor(0.0, device=embeddings.device)
+        
         # 计算嵌入向量之间的余弦相似度矩阵
         embedding_sim = torch.mm(embeddings_norm, embeddings_norm.t()) / self.temperature
+        
+        # 数值稳定性：限制相似度的范围
+        embedding_sim = torch.clamp(embedding_sim, -5.0, 5.0)
 
         # 计算基数差异矩阵
         card_diff = torch.abs(cardinalities.unsqueeze(1) - cardinalities.unsqueeze(0))
@@ -58,14 +72,25 @@ class ContrastiveLoss(nn.Module):
         # 将相似度矩阵按行应用softmax
         exp_sim = torch.exp(embedding_sim)
         
+        # 添加数值稳定性检查
+        exp_sim = torch.clamp(exp_sim, min=1e-12, max=1e12)
+        
         # 计算每个样本与其所有其他样本的相似度总和
-        log_prob = embedding_sim - torch.log(exp_sim.sum(1, keepdim=True))
+        sum_exp_sim = exp_sim.sum(1, keepdim=True)
+        # 防止除零错误
+        sum_exp_sim = torch.clamp(sum_exp_sim, min=1e-12)
+        
+        log_prob = embedding_sim - torch.log(sum_exp_sim)
 
         # 计算正样本对的平均log-likelihood
         # 我们希望最大化这个值，所以损失是它的负数
         mean_log_prob_pos = (positive_mask * log_prob).sum(1) / (positive_mask.sum(1) + 1e-8)
 
         loss = -mean_log_prob_pos.mean()
+        
+        # 检查最终损失是否为NaN
+        if torch.isnan(loss):
+            return torch.tensor(0.0, device=embeddings.device)
         
         return loss
 

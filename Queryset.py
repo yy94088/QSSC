@@ -384,11 +384,22 @@ class QueryDataset(Dataset):
 		decomp_x, decomp_edge_attr, decomp_edge_attr: list[Tensor]
 		"""
 		decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card = self.queries[index]
+		
+		# 检查card是否有效
+		if card <= 0 or math.isnan(card) or math.isinf(card):
+			# 使用一个小的正值代替无效值
+			card = 1.0
+			
 		idx = math.ceil(math.log(card, self.label_base))
 		idx = self.num_classes - 1 if idx >= self.num_classes else idx
 		card = torch.tensor(math.log(card, 2), dtype=torch.float)
 		label = torch.tensor(idx, dtype=torch.long)
-		soft_card = torch.tensor(math.log(soft_card, 2), dtype=torch.float)
+		
+		# 处理soft_card可能为0或负数的情况
+		if soft_card is None or soft_card <= 0 or math.isnan(soft_card) or math.isinf(soft_card):
+			soft_card = torch.tensor(float('nan'), dtype=torch.float)
+		else:
+			soft_card = torch.tensor(math.log(soft_card, 2), dtype=torch.float)
 
 		return decomp_x, decomp_edge_index, decomp_edge_attr, card, label, soft_card
 

@@ -17,7 +17,7 @@ def save_true_card(card: str, card_save_path: str, run_time= None):
 def load_card(card_load_path: str):
 	with open(card_load_path, "r") as in_file:
 		card = in_file.readline().strip()
-		card = int(card)
+		card = int(float(card))
 		in_file.close()
 	return card
 
@@ -199,7 +199,7 @@ def model_checkpoint(args, model, optimizer, scheduler=None, model_dir = None):
 			"model": model.state_dict(),
 			"optimizer": optimizer.state_dict()
 		}
-	model_save_path = os.path.join(args.model_save_dir, args.dataset)
+	model_save_path = os.path.join(args.model_save_dir)
 	print("model_path:", model_save_path)
 	make_dir(model_save_path)
 	cumulative_flag = "cumu" if args.cumulative else "nocumu"

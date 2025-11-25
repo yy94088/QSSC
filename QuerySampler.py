@@ -8,8 +8,6 @@ from util import make_dir, save_true_card
 import tqdm
 from multiprocessing import Pool, cpu_count
 import functools
-from FlowSC import generate_adjacency_matrix, bfs_layers, data_flow, query_flow, generate_query_adj
-from FlowSC import Find_Candidates, Flow_Learner
 import logging
 import torch
 import json
@@ -17,6 +15,7 @@ import time
 import subprocess
 import psutil
 from tqdm import tqdm
+import faiss
 
 def load_graph(fname):
 	file = open(fname)
@@ -177,9 +176,9 @@ def process_single_query_parallel(args_tuple):
     """
     并行处理单个查询的函数
     """
-    (query_load_path, card_load_path, data_graph_path, teacher_model_path, 
+    (query_load_path, card_load_path, data_graph_path, 
      queryset_load_path, true_card_load_path, pattern, size, idx, 
-     edge_embeds, edge_index_map, device, upper_card, lower_card, dataset) = args_tuple
+     edge_embeds, edge_index_map, upper_card, lower_card, dataset) = args_tuple
     
     try:
         # 用dataset参数初始化QueryDecompose，确保加载正确的edge_embeds
@@ -188,10 +187,8 @@ def process_single_query_parallel(args_tuple):
             true_card_dir=true_card_load_path.replace(f"/{pattern}_{size}", ""),
             dataset=dataset,
             pattern=pattern,
-            teacher_model_path=teacher_model_path,
             k=3,
-            size=size,
-            device=device
+            size=size
         )
         temp_qd.edge_embeds = edge_embeds
         temp_qd.edge_index_map = edge_index_map
@@ -201,30 +198,12 @@ def process_single_query_parallel(args_tuple):
         # 加载查询
         query, label_den = temp_qd.load_query(query_load_path)
         graphs = temp_qd.decompose(query)
-        true_card = temp_qd.load_card(card_load_path)
+        true_card, soft_card = temp_qd.load_card(card_load_path)
         
         if true_card >= upper_card or true_card < lower_card:
             return None
         
         true_card = true_card + 1 if true_card == 0 else true_card
-        
-        # 加载教师模型进行预测
-        device_torch = torch.device(device if torch.cuda.is_available() else 'cpu')
-        
-        # 确保CUDA正确初始化
-        if device_torch.type == 'cuda':
-            torch.cuda.empty_cache()
-            torch.cuda.set_device(device_torch)
-        
-        teacher_model = Flow_Learner(out_dim=128).to(device_torch)
-        state_dict = torch.load(teacher_model_path, map_location=device_torch)
-        teacher_model.load_state_dict(state_dict)
-        teacher_model.eval()
-        
-        with torch.no_grad():
-            query_generator, data_generator = temp_qd.generate_teacher_inputs(data_graph_path, query_load_path)
-            pred_count = teacher_model(query_generator, data_generator, device_torch).item()
-            soft_card = pred_count
         
         # 序列化图
         graph_key = temp_qd.serialize_graph(query)
@@ -237,7 +216,8 @@ def process_single_query_parallel(args_tuple):
             'soft_card': soft_card,
             'label_den': label_den,
             'graph_key': graph_key,
-            'query_id': (pattern, size, idx)
+            'query_id': (pattern, size, idx),
+            'file_name': os.path.basename(query_load_path)  # <-- added filename
         }
         
     except Exception as e:
@@ -245,7 +225,7 @@ def process_single_query_parallel(args_tuple):
         return None
 
 class QueryDecompose(object):
-	def __init__(self, queryset_dir: str, true_card_dir: str, dataset: str, pattern: str,teacher_model_path: str, k = 3, size = 4, device='cuda:0'):
+	def __init__(self, queryset_dir: str, true_card_dir: str, dataset: str, pattern: str, k = 3, size = 4):
 		"""
 		load the query graphs, true counts and perform query decomposition
 		"""
@@ -257,21 +237,32 @@ class QueryDecompose(object):
 		self.k = k
 		self.pattern = pattern
 		self.size = size
-		self.teacher_model_path = teacher_model_path
-		self.device = device
 		self.edge_embeds = np.load(os.path.join("data/prone", dataset+"_edge.emb.npy"))
 		map_path = os.path.join("data/prone", dataset+"_edge_index_map.json")
 		with open(map_path, "r") as f:
 			self.edge_index_map = json.load(f)
 		self.data_graph_path = os.path.join("data/dataset", dataset, dataset+".txt")
 		self.num_queries = 0
-		self.all_subsets = {} # {(size, patten) -> [(decomp_graphs, true_card, softcard]}
+		self.all_subsets = {} # {(size, patten) -> [(decomp_graphs, true_card, soft_card]}
 		# preserve the undecomposed queries
 		self.all_queries = {} # {(size, patten) -> [(graph, card, softcard)]}
 		self.train_graphs = {} # 存储训练查询图和预测计数
 		self.query_indices = {}  # 存储查询索引到原始query的映射
+		self.query_file_names = {}  # 存储查询索引到文件名的映射
+		
+		# ANN for similarity search
+		self.ann_index = None
+		self.ann_index_keys = [] # Maps faiss index to graph_key
+		self.ann_data = {} # graph_key -> {embedding, card}
+		self.ann_capacity = 10000 # Max number of queries to store
+		
 		self.lower_card = 10 ** 0
 		self.upper_card = 10 ** 20
+
+	def _init_ann_index(self, dim):
+		if self.ann_index is None:
+			logging.info(f"Initializing FAISS index with dimension {dim} and capacity {self.ann_capacity}")
+			self.ann_index = faiss.IndexFlatIP(dim) # Using Inner Product (cosine similarity on normalized vectors)
 
 	def decompose_queries_parallel(self, num_workers=None):
 		"""
@@ -297,11 +288,6 @@ class QueryDecompose(object):
 		else:
 			print("CUDA not available, using CPU")
 		
-		# 验证模型文件
-		if not os.path.exists(self.teacher_model_path):
-			logging.error(f'Teacher model file not found: {self.teacher_model_path}')
-			raise FileNotFoundError(f'Teacher model file not found: {self.teacher_model_path}')
-		
 		queries_dir = os.path.join(self.queryset_load_path, self.pattern+'_'+str(self.size))
 		self.all_subsets[(self.pattern, self.size)] = []
 		self.all_queries[(self.pattern, self.size)] = []
@@ -323,9 +309,9 @@ class QueryDecompose(object):
 		args_list = []
 		for query_load_path, card_load_path, idx in query_files:
 			args_tuple = (
-				query_load_path, card_load_path, self.data_graph_path, self.teacher_model_path,
-				self.queryset_load_path, self.true_card_load_path, self.pattern, self.size, idx,
-				self.edge_embeds, self.edge_index_map, self.device, self.upper_card, self.lower_card, self.dataset
+				query_load_path, card_load_path, self.data_graph_path, self.queryset_load_path, 
+				self.true_card_load_path, self.pattern, self.size, idx,
+				self.edge_embeds, self.edge_index_map, self.upper_card, self.lower_card, self.dataset
 			)
 			args_list.append(args_tuple)
 		
@@ -352,6 +338,7 @@ class QueryDecompose(object):
 			label_den = result['label_den']
 			graph_key = result['graph_key']
 			query_id = result['query_id']
+			file_name = result.get('file_name', f"{query_id[0]}_{query_id[1]}_{idx}")
 			
 			avg_label_den += label_den
 			
@@ -361,6 +348,7 @@ class QueryDecompose(object):
 			# 存储训练查询图（序列化后）
 			self.train_graphs[graph_key] = {"graph": query, "pred": None}
 			self.query_indices[(self.pattern, self.size, idx)] = query
+			self.query_file_names[(self.pattern, self.size, idx)] = file_name  # use returned filename
 			self.num_queries += 1
 		
 		end_time = time.time()
@@ -377,22 +365,6 @@ class QueryDecompose(object):
 			raise RuntimeError("No queries were successfully processed. Check the error messages above for details.")
 
 	def decompose_queries(self):
-		# 验证模型文件
-		if not os.path.exists(self.teacher_model_path):
-			logging.error(f'Teacher model file not found: {self.teacher_model_path}')
-			raise FileNotFoundError(f'Teacher model file not found: {self.teacher_model_path}')
-		    # 加载教师模型
-		device = torch.device(self.device if torch.cuda.is_available() else 'cpu')
-		teacher_model = Flow_Learner(out_dim=128).to(device)
-		try:
-			state_dict = torch.load(self.teacher_model_path, map_location=device)
-			teacher_model.load_state_dict(state_dict)
-			logging.info(f'Teacher model loaded successfully from {self.teacher_model_path}')
-			logging.info(f'Sample parameter: {next(iter(teacher_model.parameters())).data[:5]}')
-		except Exception as e:
-			logging.error(f'Failed to load teacher model: {str(e)}')
-			raise
-		teacher_model.eval()
 		avg_label_den = 0.0
 		distinct_card = {}
 		queries_dir = os.path.join(self.queryset_load_path, self.pattern+'_'+str(self.size))
@@ -407,16 +379,11 @@ class QueryDecompose(object):
 			query, label_den = self.load_query(query_load_path)
 			avg_label_den += label_den
 			graphs = self.decompose(query)
-			true_card = self.load_card(card_load_path)
+			true_card, soft_card = self.load_card(card_load_path)
 			if true_card >=  self.upper_card or true_card < self.lower_card:
 				continue
 			true_card = true_card + 1 if true_card == 0 else true_card
 			
-			with torch.no_grad():
-				query_generator, data_generator = self.generate_teacher_inputs(self.data_graph_path,query_load_path)
-				pred_count = teacher_model(query_generator, data_generator, self.device).item()
-				soft_card = pred_count
-				# soft_label = int(np.ceil(np.log10(pred_count + 1e-8)))  # Classification label
 			query_id = (self.pattern, self.size, idx)
 			self.all_subsets[(self.pattern, self.size)].append((graphs, true_card, soft_card))
 			self.all_queries[(self.pattern, self.size)].append((query, true_card, soft_card))
@@ -424,6 +391,7 @@ class QueryDecompose(object):
 			graph_key = self.serialize_graph(query)
 			self.train_graphs[graph_key] = {"graph": query, "pred": None}  # pred 在训练时更新
 			self.query_indices[(self.pattern, self.size, idx)] = query  # 存储索引到query的映射
+			self.query_file_names[(self.pattern, self.size, idx)] = query_dir  # 存储索引到文件名的映射
 			self.num_queries += 1
 			# save the decomposed query
 			#query_save_path = os.path.splitext(query_load_path)[0] + ".pickle"
@@ -470,6 +438,60 @@ class QueryDecompose(object):
 		if graph_key in self.train_graphs:
 			self.train_graphs[graph_key]["pred"] = pred
 	
+	def update_ann_index(self, graph, embedding, card):
+		"""更新ANN索引和数据存储"""
+		graph_key = self.serialize_graph(graph)
+		if graph_key in self.ann_data:
+			return # Already in index
+
+		if self.ann_index is None:
+			self._init_ann_index(embedding.shape[-1])
+
+		if len(self.ann_index_keys) >= self.ann_capacity:
+			# Simple FIFO eviction policy
+			key_to_remove = self.ann_index_keys.pop(0)
+			del self.ann_data[key_to_remove]
+			self.ann_index.remove_ids(np.array([0])) # In IndexFlat, removing is tricky. Rebuild is safer.
+			# For simplicity, we'll just let it grow for now. A real implementation needs a robust eviction.
+			logging.warning("ANN index capacity reached. Eviction policy not fully implemented.")
+			# A simple robust way is to rebuild, but that's slow.
+			# Let's just stop adding for now.
+			return
+
+		normalized_embedding = torch.nn.functional.normalize(embedding, p=2, dim=-1).cpu().numpy()
+		
+		new_id = self.ann_index.ntotal
+		self.ann_index.add(normalized_embedding)
+		self.ann_index_keys.append(graph_key)
+		self.ann_data[graph_key] = {"embedding": embedding, "card": card}
+
+	def find_k_nearest_neighbors(self, query_embedding, k=3, threshold=0.9):
+		"""使用FAISS查找k个最近邻"""
+		if self.ann_index is None or self.ann_index.ntotal == 0:
+			return [], [], -1.0
+
+		normalized_embedding = torch.nn.functional.normalize(query_embedding, p=2, dim=-1).detach().cpu().numpy()
+		
+		# Search for k neighbors
+		distances, indices = self.ann_index.search(normalized_embedding, k)
+		
+		similar_embeddings = []
+		similar_cards = []
+		
+		# The first result is the query itself if it's in the index, but here we search for external queries.
+		# Filter by threshold
+		for i in range(k):
+			idx = indices[0][i]
+			dist = distances[0][i]
+			if idx != -1 and dist >= threshold:
+				graph_key = self.ann_index_keys[idx]
+				data = self.ann_data[graph_key]
+				similar_embeddings.append(data["embedding"])
+				similar_cards.append(data["card"])
+
+		max_similarity = distances[0][0] if distances.size > 0 and indices[0][0] != -1 else -1.0
+		return similar_embeddings, similar_cards, max_similarity
+
 	def get_query_by_index(self, pattern, size, idx):
 		"""根据索引获取原始查询图"""
 		return self.query_indices.get((pattern, size, idx))
@@ -477,7 +499,7 @@ class QueryDecompose(object):
 	def decompose(self, query):
 		graphs = []
 		for src in query.nodes():
-			G = self.k_hop_spanning_tree(query, src)
+			G = self.k_hop_induced_subgraph(query, src)
 			graphs.append(G)
 		return graphs
 
@@ -506,22 +528,25 @@ class QueryDecompose(object):
 
 	def k_hop_induced_subgraph(self, query, src):
 		nodes_list = [src]
-		Q = queue.Queue()
-		Q.put(src)
+		q = queue.Queue()
+		q.put(src)
+		visited = {src}
 		depth = 0
-		while not Q.empty():
-			s = Q.qsize()
-			for _ in range(s):
-				cur = Q.get()
-				for next in query.neighbors(cur):
-					if next in nodes_list:
-						continue
-					Q.put(next)
-					nodes_list.append(next)
-			depth += 1
-			if depth >= self.k:
-				break
-		edges_list = query.subgraph(nodes_list).edges()
+		
+		head = 0
+		while head < len(nodes_list) and depth < self.k:
+			curr_node = nodes_list[head]
+			head += 1
+			for neighbor in query.neighbors(curr_node):
+				if neighbor not in visited:
+					visited.add(neighbor)
+					nodes_list.append(neighbor)
+			
+			if head == len(nodes_list): # Finished a level
+				depth += 1
+
+		subgraph = query.subgraph(nodes_list)
+		edges_list = list(subgraph.edges())
 		G = self.node_reorder(query, nodes_list, edges_list)
 		return G
 
@@ -584,31 +609,12 @@ class QueryDecompose(object):
 		label_den = float(label_cnt) / query.number_of_nodes()
 		return query, label_den
 	
-	def generate_teacher_inputs(self, data_graph_path, query_graph_path):
-
-		# 调用 Find_Candidates
-		finder = Find_Candidates(data_graph_path, query_graph_path)
-		output_q_info, output_g_info = finder.cpp_GQL()
-			
-		cs_size, candidates_size, g_nodes, g_edges = output_g_info
-		q_vertices, q_labels, q_degrees, q_edges= output_q_info
-
-		root = cs_size.index(max(cs_size))
-		layers = bfs_layers(q_edges, root)             
-
-		query_adj = generate_query_adj(q_edges, len(q_vertices))
-		query_generator = query_flow(query_adj, q_labels, layers)
-
-		adj = generate_adjacency_matrix(g_edges, candidates_size)
-		data_generator = data_flow(q_labels, g_nodes, layers, root, adj)
-		return query_generator, data_generator
-
 	def load_card(self, card_load_path):
 		with open(card_load_path, "r") as in_file:
-			card = in_file.readline().strip()
-			card = int(card)
+			true_card = float(in_file.readline().strip())
+			soft_card = float(in_file.readline().strip())
 			in_file.close()
-		return card
+		return true_card, soft_card
 
 	def save_decomposed_query(self, graphs, card, save_path):
 		with open(save_path, "wb") as out_file:

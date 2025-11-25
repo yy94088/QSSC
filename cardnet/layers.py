@@ -15,7 +15,9 @@ class MLP(nn.Module):
     def __init__(self, in_ch, hid_ch, out_ch):
         super(MLP, self).__init__()
         self.fc1 = FC(in_ch, hid_ch)
-        self.fc2 = FC(hid_ch, out_ch)
+        hid_ch2 = hid_ch // 2
+        self.fc2 = FC(hid_ch, hid_ch2)
+        self.fc3 = FC(hid_ch2, out_ch)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))

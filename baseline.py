@@ -222,7 +222,7 @@ class EvalBaseline(object):
 	def load_card(self, card_load_path):
 		with open(card_load_path, "r") as in_file:
 			card = in_file.readline().strip()
-			card = int(card)
+			card = int(float(card))
 			in_file.close()
 		return card
 

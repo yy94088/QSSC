@@ -68,22 +68,30 @@ def generate_node_embeddings(G, label_dict, dim):
         laplacian = csgraph.laplacian(adj_matrix, normed=True)
         
         # Spectral decomposition: compute top-k eigenvectors
-        k = min(32, num_nodes - 1)  # Reduce k for stability
+        # Increase k for better quality embeddings
+        k = min(dim, num_nodes - 1)  # Use dim instead of fixed 32 for better representation
         try:
-            _, eigenvectors = eigsh(laplacian, k=k, which='SM', maxiter=5000, tol=1e-4, ncv=2*k+1)
+            eigenvalues, eigenvectors = eigsh(laplacian, k=k, which='SM', maxiter=5000, tol=1e-4, ncv=2*k+1)
             node_embeds = eigenvectors[:, :k]
+            
+            # Apply eigenvalue weighting for better spectral embedding
+            weights = np.exp(-eigenvalues[:k])
+            node_embeds = node_embeds * weights[np.newaxis, :]
         except Exception as e:
             logging.warning(f"eigsh failed: {e}. Falling back to random embeddings.")
             node_embeds = np.random.rand(num_nodes, k).astype(np.float32)
         
-        # Pad to ensure at least dim columns
+        # Pad or truncate to ensure exactly dim columns
         if node_embeds.shape[1] < dim:
             pad_width = ((0, 0), (0, dim - node_embeds.shape[1]))
             node_embeds = np.pad(node_embeds, pad_width, mode='constant')
         elif node_embeds.shape[1] > dim:
             node_embeds = node_embeds[:, :dim]
         
-        # Normalize node embeddings
+        # Enhanced normalization with unit length and centering
+        # Center the embeddings
+        node_embeds = node_embeds - np.mean(node_embeds, axis=0, keepdims=True)
+        # Normalize to unit length
         node_embeds = node_embeds / (np.linalg.norm(node_embeds, axis=1, keepdims=True) + 1e-10)
         
         # Generate label embeddings by averaging node embeddings with same label
@@ -97,7 +105,8 @@ def generate_node_embeddings(G, label_dict, dim):
                 label_counts[idx] += 1
         label_embeds = label_embeds / (label_counts[:, np.newaxis] + 1e-10)
         
-        # Normalize label embeddings
+        # Enhanced label embedding normalization
+        # Apply additional L2 normalization
         label_embeds = label_embeds / (np.linalg.norm(label_embeds, axis=1, keepdims=True) + 1e-10)
         
         # Verify mapping alignment
@@ -130,11 +139,16 @@ def generate_edge_embeddings(G, label_embeds, label_dict, edge_dim):
             edge_type = (src_label, dst_label)
             src_vec = label_embeds[label_dict[src_label]]
             dst_vec = label_embeds[label_dict[dst_label]]
-            edge_vec = (src_vec + dst_vec) / 2
+            # Use concatenation instead of averaging for more expressive edge embeddings
+            edge_vec = np.concatenate([src_vec, dst_vec])
             
             # 维度调整
             if edge_vec.shape[0] > edge_dim:
-                projection = np.random.rand(edge_vec.shape[0], edge_dim).astype(np.float32)
+                # Use random projection for dimensionality reduction
+                np.random.seed(42)  # For reproducibility
+                projection = np.random.randn(edge_vec.shape[0], edge_dim).astype(np.float32)
+                # Apply proper normalization to the projection matrix
+                projection = projection / np.sqrt(edge_dim)
                 edge_vec = np.dot(edge_vec, projection)
             elif edge_vec.shape[0] < edge_dim:
                 edge_vec = np.pad(edge_vec, (0, edge_dim - edge_vec.shape[0]), mode='constant')
@@ -143,6 +157,8 @@ def generate_edge_embeddings(G, label_embeds, label_dict, edge_dim):
             edge_index_map[edge_type].append(idx)
         
         edge_embeds = np.array(edge_embeds)
+        # Enhanced normalization
+        edge_embeds = edge_embeds - np.mean(edge_embeds, axis=0, keepdims=True)
         edge_embeds = edge_embeds / (np.linalg.norm(edge_embeds, axis=1, keepdims=True) + 1e-10)
         
         return edge_embeds, edge_index_map
