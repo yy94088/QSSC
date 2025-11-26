@@ -9,6 +9,28 @@ import math
 import logging
 from cardnet.loss import ContrastiveLoss
 
+# 向量化的概率分布计算函数（避免在训练循环中重复定义）
+def value_to_prob_distribution_vectorized(values, bins, sigma=1.0):
+	"""
+	向量化计算值到概率分布的转换
+	values: shape (batch_size,)
+	bins: shape (num_bins+1,)
+	返回: shape (batch_size, num_bins)
+	"""
+	# 扩展维度以进行广播计算
+	values = values.unsqueeze(1)  # (batch_size, 1)
+	bins_low = bins[:-1].unsqueeze(0)  # (1, num_bins)
+	bins_high = bins[1:].unsqueeze(0)  # (1, num_bins)
+	
+	# 向量化计算CDF
+	cdf_high = 0.5 * (1 + torch.erf((bins_high - values) / (sigma * math.sqrt(2))))
+	cdf_low = 0.5 * (1 + torch.erf((bins_low - values) / (sigma * math.sqrt(2))))
+	probs = cdf_high - cdf_low  # (batch_size, num_bins)
+	
+	# 归一化
+	probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-8)
+	return probs
+
 class ActiveLearner:
 	def __init__(self, args, QD=None):
 		self.args = args
@@ -65,6 +87,9 @@ class ActiveLearner:
 						# 常规预测方法
 						output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr, card)
 					
+					# 保存原始输出用于KL散度计算
+					output_orig = output
+					
 					# 统一处理输出维度
 					if isinstance(output, torch.Tensor):
 						output = output.squeeze()
@@ -103,41 +128,35 @@ class ActiveLearner:
 								loss += self.distill_alpha * distill_loss
 								epoch_loss_distill += distill_loss.item()
 							
-						# KL散度蒸馏损失 - 基于区间策略的概率分布
+						# KL散度蒸馏损失 - 基于区间策略的概率分布（优化版本）
 						if self.distill_kl_alpha > 0:
-							# 将数值转换为概率分布后再计算KL散度
-							# 首先确定区间的边界（基于真实值和教师预测值的范围）
-							min_val = min(torch.min(card).item(), torch.min(soft_card).item(), torch.min(output).item())
-							max_val = max(torch.max(card).item(), torch.max(soft_card).item(), torch.max(output).item())
+							# 使用原始输出进行KL散度计算，确保有batch维度
+							output_for_kl = output_orig.squeeze()
+							if output_for_kl.dim() == 0:
+								output_for_kl = output_for_kl.unsqueeze(0)
+							if soft_card.dim() == 0:
+								soft_card = soft_card.unsqueeze(0)
+							if card.dim() == 0:
+								card_for_kl = card.unsqueeze(0)
+							else:
+								card_for_kl = card
 							
-							# 添加一些边界扩展以确保覆盖所有值
+							# 使用torch操作快速计算min/max（避免.item()调用）
+							all_values = torch.cat([card_for_kl.flatten(), soft_card.flatten(), output_for_kl.flatten()])
+							min_val = all_values.min().item()
+							max_val = all_values.max().item()
+							
+							# 添加边界扩展
 							range_extension = (max_val - min_val) * 0.1
 							min_val -= range_extension
 							max_val += range_extension
 							
-							# 创建等间距的bins
-							bins = torch.linspace(min_val, max_val, self.distill_kl_bins + 1).to(card.device)
+							# 创建bins
+							bins = torch.linspace(min_val, max_val, self.distill_kl_bins + 1).to(card_for_kl.device)
 							
-							# 计算每个值落在各个区间内的概率（使用正态分布近似）
-							def value_to_prob_distribution(value, bins, sigma=1.0):
-								# 对于每个值，计算其在所有bins中的概率密度
-								probs = torch.zeros(len(bins) - 1).to(value.device)
-								for i in range(len(bins) - 1):
-									# 使用累积分布函数计算值落在区间内的概率
-									# 近似为以value为中心的正态分布
-									cdf_high = 0.5 * (1 + torch.erf((bins[i+1] - value) / (sigma * math.sqrt(2))))
-									cdf_low = 0.5 * (1 + torch.erf((bins[i] - value) / (sigma * math.sqrt(2))))
-									probs[i] = cdf_high - cdf_low
-								return probs / (probs.sum() + 1e-8)  # 归一化
-							
-							# 计算教师预测和学生预测的概率分布
-							batch_size = card.shape[0]
-							teacher_probs = torch.zeros(batch_size, self.distill_kl_bins).to(card.device)
-							student_probs = torch.zeros(batch_size, self.distill_kl_bins).to(card.device)
-							
-							for b in range(batch_size):
-								teacher_probs[b] = value_to_prob_distribution(soft_card[b], bins)
-								student_probs[b] = value_to_prob_distribution(output[b], bins)
+							# 使用向量化函数计算概率分布（大幅提升性能）
+							teacher_probs = value_to_prob_distribution_vectorized(soft_card, bins)
+							student_probs = value_to_prob_distribution_vectorized(output_for_kl, bins)
 							
 							# 添加小的epsilon值避免log(0)
 							eps = 1e-8

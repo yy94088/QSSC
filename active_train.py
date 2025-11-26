@@ -271,8 +271,8 @@ if __name__ == "__main__":
 	parser.add_argument("--pattern", type=str, default='query',
 					help="Specific pattern_size to load (e.g., query_4 query_8)")
 	parser.add_argument("--size", type=int, default=8)
-	parser.add_argument("--distill_alpha", type=float, default=0)
-	parser.add_argument("--distill_kl_alpha", type=float, default=0)
+	parser.add_argument("--distill_alpha", type=float, default=0.3)
+	parser.add_argument("--distill_kl_alpha", type=float, default=0.2)
 	parser.add_argument("--distill_kl_bins", type=int, default=10)
 	# Active Learner settings
 	parser.add_argument("--uncertainty", default="consist", type=str,
