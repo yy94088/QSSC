@@ -71,27 +71,10 @@ class ActiveLearner:
 							_to_cuda(decomp_x), _to_cuda(decomp_edge_index), _to_cuda(decomp_edge_attr)
 						card, label, soft_card = card.cuda(), label.cuda(), soft_card.cuda()
 
-					# Memory机制：训练时使用真实card帮助检索，推理时会使用迭代预测
-					if self.args.memory_size > 0:
-						# 训练时：使用真实card进行memory检索
-						# 这样memory能学习到"真实card对应什么样的query embedding"的正确关联
-						# 推理时（evaluate函数中）会使用迭代预测来逼近真实card
-						output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr, card=card)
-					else:
-						# 常规预测方法（不使用memory）
-						output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr, card)
+					# 模型前向：直接使用提供的card进行预测（模型不再在内部使用memory）
+					output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr, card)
 					
-					# 保存query embedding用于memory更新
-					if self.args.memory_size > 0 and isinstance(hid_g, torch.Tensor):
-						# hid_g 是 x_combined = [query_emb, retrieved_emb]
-						# 提取原始query embedding（前半部分）
-						emb_dim = model.memory_bank.embedding_dim
-						if hid_g.size(1) == emb_dim * 2:
-							# x_combined包含[query_emb, retrieved_emb]
-							batch_query_emb = hid_g[:, :emb_dim].detach()  # 只取前半部分
-						else:
-							# 如果维度不匹配，可能是没有检索到memory
-							batch_query_emb = hid_g.detach()
+					# hid_g 为模型返回的隐藏表示，可用于对比学习或外部处理
 					
 					# 保存原始输出用于KL散度计算
 					output_orig = output
@@ -208,18 +191,7 @@ class ActiveLearner:
 					optimizer.step()
 					optimizer.zero_grad()
 
-					# 更新memory（传入prediction error）
-					if self.args.memory_size > 0 and 'batch_query_emb' in locals():
-						# 数据已经是log2 scale，直接计算差值即可
-						prediction_error = torch.abs(output - card).item()
-						model.memory_bank.update_memory(
-							batch_query_emb, 
-							card, 
-							prediction_error=prediction_error
-						)
-
-						# batch_embeddings = []
-						# batch_cards = []
+					# memory update disabled (active-related features removed)
 
 
 					# 存储训练预测（仅最后一次epoch）
@@ -236,13 +208,7 @@ class ActiveLearner:
 				print("{}-th QuerySet, {}-th Epoch: Reg. Loss={:.4f}, Cla. Loss={:.4f}, Distill Loss={:.4f}, Distill KL Loss={:.4f}"
 					  .format(loader_idx, epoch, epoch_loss, epoch_loss_cla, epoch_loss_distill, epoch_loss_distill_kl))
 				
-				# 打印memory统计（每5个epoch）
-				if (epoch + 1) % 5 == 0 and hasattr(model, 'memory_bank') and model.memory_bank is not None:
-					stats = model.memory_bank.get_statistics()
-					print(f"Memory Stats - Entries: {stats['total_entries']}, "
-						  f"Avg Quality: {stats['avg_quality']:.3f}, "
-						  f"Success Rate: {stats['retrieval_success_rate']:.1%}, "
-						  f"Threshold: {stats['current_threshold']:.3f}")
+				# memory statistics printing disabled (active-related features removed)
 
 			# Evaluation the model
 			all_eval_res = self.evaluate(model, criterion, val_datasets, print_res = True)
@@ -277,21 +243,10 @@ class ActiveLearner:
 						_to_cuda(decomp_x), _to_cuda(decomp_edge_index), _to_cuda(decomp_edge_attr)
 					card, label, soft_card = card.cuda(), label.cuda(), soft_card.cuda()
 				
-				# 使用迭代预测直到收敛
+				# 直接前向预测（模型不再包含迭代预测逻辑）
 				with torch.no_grad():
-					if self.args.memory_size > 0:
-						# 迭代预测直到收敛
-						output, iterations = model.iterative_predict(
-							decomp_x, decomp_edge_index, decomp_edge_attr,
-							max_iterations=self.max_iterations,
-							tolerance=self.tolerance
-						)
-						output_cla = None  # 分类输出在迭代预测中未使用
-						hid_g = None       # 隐藏状态在迭代预测中未使用
-					else:
-						# 常规预测方法
-						output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr)
-					
+					output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr)
+				
 					# 统一处理输出维度
 					if isinstance(output, torch.Tensor):
 						output = output.squeeze()
