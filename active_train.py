@@ -180,7 +180,7 @@ def cross_validate(args):
 		scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_factor)
 		_, fold_elapse_time = active_learner.train(model=model, criterion=criterion, criterion_cal=criterion_cla,
 									train_datasets=train_datasets, val_datasets=val_datasets,
-									optimizer=optimizer, scheduler=scheduler, active=True)
+									optimizer=optimizer, scheduler=scheduler, active=False)
 		total_elapse_time += fold_elapse_time
 		fold_eval_res = active_learner.evaluate(model=model, criterion=criterion, eval_datasets=val_datasets)
 		# merge the result of the evaluation result of each fold
@@ -208,7 +208,7 @@ def cross_validate(args):
 if __name__ == "__main__":
 	parser = ArgumentParser("LSS", formatter_class=ArgumentDefaultsHelpFormatter, conflict_handler="resolve")
 	# Model Settings (ONLY FOR CardNet MODEL)
-	parser.add_argument("--num_layers", default=3, type=int,
+	parser.add_argument("--num_layers", default=2, type=int,
 						help="number of convolutional layers")
 	parser.add_argument("--model_type", default="NNGINETransformer", type=str,
 						help="GNN layer type") # GIN, GINE, GAT, NN, GCN, SAGE, NNGIN, NNGINConcat, NNGINETransformer
@@ -232,7 +232,7 @@ if __name__ == "__main__":
 						help='shards pooling layer type')
 	parser.add_argument('--dropout', type=float, default=0.2,
 						help='Dropout rate (1 - keep probability).')
-	parser.add_argument('--memory_size', type=int, default=20,
+	parser.add_argument('--memory_size', type=int, default=100,
 						help='Size of the query memory bank. 0 means disabled.')
 	parser.add_argument('--similarity_threshold', type=float, default=0.7,
 						help='Similarity threshold for memory retrieval and update.')
@@ -271,7 +271,16 @@ if __name__ == "__main__":
 	parser.add_argument("--pattern", type=str, default='query',
 					help="Specific pattern_size to load (e.g., query_4 query_8)")
 	parser.add_argument("--size", type=int, default=8)
-	parser.add_argument("--distill_alpha", type=float, default=0.3)
+	# Improved Memory Bank settings
+	parser.add_argument('--use_improved_memory', action='store_true',
+						help='Use improved query memory bank (recommended)')
+	parser.add_argument('--high_quality_ratio', type=float, default=0.7,
+						help='Ratio of high-quality memory zone (default: 0.7)')
+	parser.add_argument('--memory_temperature', type=float, default=0.1,
+						help='Temperature for memory attention (default: 0.1)')
+	parser.add_argument('--base_similarity_threshold', type=float, default=0.85,
+						help='Base similarity threshold (default: 0.85, will be adapted)')
+	parser.add_argument("--distill_alpha", type=float, default=0.5)
 	parser.add_argument("--distill_kl_alpha", type=float, default=0.2)
 	parser.add_argument("--distill_kl_bins", type=int, default=10)
 	# Active Learner settings

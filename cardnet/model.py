@@ -6,6 +6,7 @@ from .layers import MLP, FC
 from torch_scatter import scatter_mean
 from torch_geometric.nn import GINConv, GINEConv, NNConv, GATConv, GraphConv, SAGEConv
 from .GINlayers import NNGINConv, NNGINConcatConv
+from .improved_memory import ImprovedQueryMemoryBank
 
 # ==================== QueryMemoryBank Definition ====================
 class QueryMemoryBank(nn.Module):
@@ -374,10 +375,12 @@ class CardNet(nn.Module):
 		self.mlp_in_ch = self.num_expert * self.out_g_ch if self.pool_type == "att" else self.out_g_ch
 		
 		if self.memory_size > 0:
-			self.memory_bank = QueryMemoryBank(
-				embedding_dim=self.mlp_in_ch, 
+			self.memory_bank = ImprovedQueryMemoryBank(
+				embedding_dim=self.mlp_in_ch,
 				memory_size=self.memory_size,
-				similarity_threshold=self.similarity_threshold
+				high_quality_ratio=getattr(args, 'high_quality_ratio', 0.7),
+				temperature=getattr(args, 'memory_temperature', 0.1),
+				base_similarity_threshold=getattr(args, 'base_similarity_threshold', 0.85)
 			)
 			predictor_in_ch = self.mlp_in_ch * 2
 		else:
@@ -490,9 +493,8 @@ class CardNet(nn.Module):
 			retrieved = self.memory_bank(x, card)
 			x_combined = torch.cat([x, retrieved], dim=1)
 			
-			# 只在训练阶段且card不为None时更新记忆库
-			if card is not None and self.training:
-				self.memory_bank.update_memory(x, card)
+			# Note: Memory update is handled externally in training loop 
+			# after loss.backward() to avoid in-place operation errors
 			
 			x = x_combined
 		else:

@@ -71,21 +71,27 @@ class ActiveLearner:
 							_to_cuda(decomp_x), _to_cuda(decomp_edge_index), _to_cuda(decomp_edge_attr)
 						card, label, soft_card = card.cuda(), label.cuda(), soft_card.cuda()
 
-					# 使用迭代预测直到收敛（训练时也使用估计的card值）
+					# Memory机制：训练时使用真实card帮助检索，推理时会使用迭代预测
 					if self.args.memory_size > 0:
-						# 迭代预测直到收敛
-						with torch.no_grad():
-							estimated_card, iterations = model.iterative_predict(
-								decomp_x, decomp_edge_index, decomp_edge_attr,
-								max_iterations=self.max_iterations,
-								tolerance=self.tolerance
-							)
-						
-						# 使用估计的card进行最终预测
-						output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr, card=estimated_card)
+						# 训练时：使用真实card进行memory检索
+						# 这样memory能学习到"真实card对应什么样的query embedding"的正确关联
+						# 推理时（evaluate函数中）会使用迭代预测来逼近真实card
+						output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr, card=card)
 					else:
-						# 常规预测方法
+						# 常规预测方法（不使用memory）
 						output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr, card)
+					
+					# 保存query embedding用于memory更新
+					if self.args.memory_size > 0 and isinstance(hid_g, torch.Tensor):
+						# hid_g 是 x_combined = [query_emb, retrieved_emb]
+						# 提取原始query embedding（前半部分）
+						emb_dim = model.memory_bank.embedding_dim
+						if hid_g.size(1) == emb_dim * 2:
+							# x_combined包含[query_emb, retrieved_emb]
+							batch_query_emb = hid_g[:, :emb_dim].detach()  # 只取前半部分
+						else:
+							# 如果维度不匹配，可能是没有检索到memory
+							batch_query_emb = hid_g.detach()
 					
 					# 保存原始输出用于KL散度计算
 					output_orig = output
@@ -202,6 +208,16 @@ class ActiveLearner:
 					optimizer.step()
 					optimizer.zero_grad()
 
+					# 更新memory（传入prediction error）
+					if self.args.memory_size > 0 and 'batch_query_emb' in locals():
+						# 数据已经是log2 scale，直接计算差值即可
+						prediction_error = torch.abs(output - card).item()
+						model.memory_bank.update_memory(
+							batch_query_emb, 
+							card, 
+							prediction_error=prediction_error
+						)
+
 						# batch_embeddings = []
 						# batch_cards = []
 
@@ -219,6 +235,14 @@ class ActiveLearner:
 					scheduler.step()
 				print("{}-th QuerySet, {}-th Epoch: Reg. Loss={:.4f}, Cla. Loss={:.4f}, Distill Loss={:.4f}, Distill KL Loss={:.4f}"
 					  .format(loader_idx, epoch, epoch_loss, epoch_loss_cla, epoch_loss_distill, epoch_loss_distill_kl))
+				
+				# 打印memory统计（每5个epoch）
+				if (epoch + 1) % 5 == 0 and hasattr(model, 'memory_bank') and model.memory_bank is not None:
+					stats = model.memory_bank.get_statistics()
+					print(f"Memory Stats - Entries: {stats['total_entries']}, "
+						  f"Avg Quality: {stats['avg_quality']:.3f}, "
+						  f"Success Rate: {stats['retrieval_success_rate']:.1%}, "
+						  f"Threshold: {stats['current_threshold']:.3f}")
 
 			# Evaluation the model
 			all_eval_res = self.evaluate(model, criterion, val_datasets, print_res = True)

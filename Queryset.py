@@ -7,7 +7,7 @@ import numpy as np
 import random
 import statistics
 import math
-
+from scipy.stats import entropy
 from torch.utils.data.dataset import Dataset
 from torch.utils.data import DataLoader
 
@@ -345,7 +345,6 @@ class DataGraph(object):
 		for key, val in node_label_card.items():
 			node_label_card[key] = val / graph.number_of_nodes()
 
-		from scipy.stats import entropy
 		print("data graph label entropy: {}".format(entropy(list(node_label_card.values()))))
 
 		for key, val in edge_label_card.items():
