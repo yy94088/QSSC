@@ -1,64 +1,37 @@
 import torch
-import torch.distributions
 import numpy as np
 import random
 from .active_util import _to_cuda, _to_dataloaders, _to_datasets, print_eval_res
-from scipy.stats import  entropy, gmean
 import datetime
-import math
-import logging
-from cardnet.loss import ContrastiveLoss, QErrorLoss, AdaptiveWeightedMSELoss
 
-# 导入数据增强模块（如果存在）
+# Import improved loss functions
+try:
+	from cardnet.loss import QErrorLoss, AdaptiveWeightedMSELoss
+except ImportError:
+	QErrorLoss = None
+	AdaptiveWeightedMSELoss = None
+
+# Import data augmentation (optional)
 try:
 	from cardnet.data_augmentation import QueryGraphAugmentation, apply_augmentation_to_batch
 	DATA_AUG_AVAILABLE = True
 except ImportError:
 	DATA_AUG_AVAILABLE = False
-	print("Warning: Data augmentation module not available")
 
-# 向量化的概率分布计算函数（避免在训练循环中重复定义）
-def value_to_prob_distribution_vectorized(values, bins, sigma=1.0):
-	"""
-	向量化计算值到概率分布的转换
-	values: shape (batch_size,)
-	bins: shape (num_bins+1,)
-	返回: shape (batch_size, num_bins)
-	"""
-	# 扩展维度以进行广播计算
-	values = values.unsqueeze(1)  # (batch_size, 1)
-	bins_low = bins[:-1].unsqueeze(0)  # (1, num_bins)
-	bins_high = bins[1:].unsqueeze(0)  # (1, num_bins)
-	
-	# 向量化计算CDF
-	cdf_high = 0.5 * (1 + torch.erf((bins_high - values) / (sigma * math.sqrt(2))))
-	cdf_low = 0.5 * (1 + torch.erf((bins_low - values) / (sigma * math.sqrt(2))))
-	probs = cdf_high - cdf_low  # (batch_size, num_bins)
-	
-	# 归一化
-	probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-8)
-	return probs
 
 class ActiveLearner:
+	"""Simplified ActiveLearner - regression only, no classification or active learning."""
+	
 	def __init__(self, args, QD=None):
 		self.args = args
 		self.QD = QD
-		self.high_error_threshold = args.high_error_threshold if hasattr(args, 'high_error_threshold') else 1.0
-		self.budget = args.budget
-		self.uncertainty = args.uncertainty
-		self.active_iters = args.active_iters
-		self.active_epochs = args.active_epochs
-		self.distill_alpha = args.distill_alpha
-		self.distill_kl_alpha = getattr(args, 'distill_kl_alpha', 0.0)  # KL散度蒸馏权重
-		self.distill_kl_bins = getattr(args, 'distill_kl_bins', 10)   # KL散度区间数
-		self.biased_sample = args.biased_sample
-		self.max_iterations = getattr(args, 'max_iterations', 5)
-		self.tolerance = getattr(args, 'tolerance', 1e-4)
+		self.high_error_threshold = getattr(args, 'high_error_threshold', 1.0)
+		self.distill_alpha = getattr(args, 'distill_alpha', 0.0)
 		
-		# 新增：损失函数类型
+		# Loss function type
 		self.loss_type = getattr(args, 'loss_type', 'mse')
 		
-		# 新增：数据增强
+		# Data augmentation
 		self.use_data_augmentation = getattr(args, 'use_data_augmentation', False)
 		if self.use_data_augmentation and DATA_AUG_AVAILABLE:
 			self.augmentor = QueryGraphAugmentation(
@@ -66,53 +39,57 @@ class ActiveLearner:
 				edge_dropout_rate=getattr(args, 'aug_edge_dropout', 0.1),
 				feature_mask_rate=getattr(args, 'aug_feature_mask', 0.1)
 			)
-			print(f"✓ Data augmentation enabled: noise={self.augmentor.feature_noise_std}, "
-				  f"edge_drop={self.augmentor.edge_dropout_rate}")
+			print(f"✓ Data augmentation enabled")
 		else:
 			self.augmentor = None
 	
 	def _get_loss_function(self):
-		"""根据配置返回合适的损失函数"""
-		if self.loss_type == 'qerror':
-			print("Using Q-Error Loss (better for cardinality estimation)")
+		"""Get appropriate loss function based on configuration."""
+		if self.loss_type == 'qerror' and QErrorLoss is not None:
+			print("Using Q-Error Loss")
 			return QErrorLoss()
-		elif self.loss_type == 'weighted_mse':
-			print(f"Using Adaptive Weighted MSE Loss (weight_exp={self.args.weight_exp})")
+		elif self.loss_type == 'weighted_mse' and AdaptiveWeightedMSELoss is not None:
+			print(f"Using Adaptive Weighted MSE Loss")
 			return AdaptiveWeightedMSELoss(weight_exp=self.args.weight_exp)
-		elif self.loss_type == 'hybrid':
-			# 混合损失：MSE + Q-Error
+		elif self.loss_type == 'hybrid' and QErrorLoss is not None:
 			print("Using Hybrid Loss (MSE + Q-Error)")
+			qerror_loss = QErrorLoss()
 			return lambda pred, target: (
 				torch.nn.functional.mse_loss(pred, target) + 
-				0.5 * QErrorLoss()(pred, target)
+				0.5 * qerror_loss(pred, target)
 			)
-		else:  # 默认MSE
+		else:
 			return torch.nn.MSELoss()
 
-	def train(self, model, criterion, criterion_cal,
-			  train_datasets, val_datasets, optimizer, scheduler=None, active = False):
+	def train(self, model, criterion, train_datasets, val_datasets, optimizer, scheduler=None):
+		"""
+		Train the model for cardinality estimation (regression only).
+		"""
 		if self.args.cuda:
 			model.to(self.args.device)
-		epochs = self.active_epochs if active else self.args.epochs
+		epochs = self.args.epochs
 
-		train_loaders = _to_dataloaders(datasets= train_datasets)
+		train_loaders = _to_dataloaders(datasets=train_datasets)
 		start = datetime.datetime.now()
 		
-		# 使用改进的损失函数
+		# Use improved loss function
 		base_criterion = self._get_loss_function()
-		contrastive_criterion = ContrastiveLoss(cardinality_threshold=self.args.cardinality_threshold)
 
 		for loader_idx, dataloader in enumerate(train_loaders):
 			model.train()
-			print("Training the {}/{} Training set".format(loader_idx, len(train_loaders)))
+			print(f"Training the {loader_idx}/{len(train_loaders)} Training set")
+			
 			for epoch in range(epochs):
-				# batch_embeddings = []
-				# batch_cards = []
-				epoch_loss, epoch_loss_cla, epoch_loss_distill, epoch_loss_distill_kl, epoch_loss_con = 0.0, 0.0, 0.0, 0.0, 0.0
-				for i, (decomp_x, decomp_edge_index, decomp_edge_attr, card, label, soft_card) in \
-						enumerate(dataloader):
+				epoch_loss = 0.0
+				
+				for i, batch_data in enumerate(dataloader):
+					# Unpack batch (handle both formats)
+					if len(batch_data) == 6:
+						decomp_x, decomp_edge_index, decomp_edge_attr, card, _, soft_card = batch_data
+					else:
+						decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card = batch_data[:5]
 					
-					# 数据增强（如果启用）
+					# Data augmentation
 					if self.augmentor is not None and model.training:
 						decomp_x, decomp_edge_index, decomp_edge_attr = apply_augmentation_to_batch(
 							decomp_x, decomp_edge_index, decomp_edge_attr, 
@@ -120,221 +97,126 @@ class ActiveLearner:
 						)
 					
 					if self.args.cuda:
-						decomp_x, decomp_edge_index, decomp_edge_attr = \
-							_to_cuda(decomp_x), _to_cuda(decomp_edge_index), _to_cuda(decomp_edge_attr)
-						card, label, soft_card = card.cuda(), label.cuda(), soft_card.cuda()
+						decomp_x = _to_cuda(decomp_x)
+						decomp_edge_index = _to_cuda(decomp_edge_index)
+						decomp_edge_attr = _to_cuda(decomp_edge_attr)
+						card = card.cuda()
+						if soft_card is not None:
+							soft_card = soft_card.cuda()
 
-					# 模型前向：直接使用提供的card进行预测（模型不再在内部使用memory）
-					output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr, card)
+					# Forward pass
+					output, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr)
 					
-					# hid_g 为模型返回的隐藏表示（或embedding），可用于对比学习或memory更新
-					# 如果模型有memory，则在训练时用真实card更新memory
-					if model.memory_bank is not None and model.training:
-						# hid_g is the embedding returned by forward (shape [1, embedding_dim])
-						# Compute prediction error for quality tracking
-						with torch.no_grad():
-							prediction_error = torch.abs(output.detach() - card).item()
-							# Update memory with query embedding, true card, and prediction error
-							model.memory_bank.update_memory(
-								query_embedding=hid_g.detach(),
-								query_cardinality=card,
-								prediction_error=prediction_error
-							)
-					
-					# 保存原始输出用于KL散度计算
-					output_orig = output
-					
-					# 统一处理输出维度
+					# Handle output dimensions
 					if isinstance(output, torch.Tensor):
 						output = output.squeeze()
-						# 如果仍然有多个元素，取均值
 						if output.numel() > 1:
 							output = output.mean()
 					
-					# 检查输出是否为NaN或inf
+					# Check for NaN/Inf
 					if torch.isnan(output).any() or torch.isinf(output).any():
-						print(f"Warning: NaN or Inf detected in model output. Skipping this batch.")
+						print(f"Warning: NaN/Inf in output. Skipping batch.")
 						optimizer.zero_grad()
 						continue
 					
-					# 检查输入数据是否有效
 					if torch.isnan(card).any() or torch.isinf(card).any():
-						print(f"Warning: NaN or Inf detected in target card. Skipping this batch.")
+						print(f"Warning: NaN/Inf in target. Skipping batch.")
 						optimizer.zero_grad()
 						continue
 
-					# 使用改进的损失函数
-					loss = base_criterion(output, card) * (1 - self.distill_alpha - self.distill_kl_alpha)
+					# Compute loss
+					loss = base_criterion(output, card)
 					
-					# 检查损失是否为NaN
 					if torch.isnan(loss):
-						print(f"Warning: NaN detected in loss. Skipping this batch.")
+						print(f"Warning: NaN in loss. Skipping batch.")
 						optimizer.zero_grad()
 						continue
 						
 					epoch_loss += loss.item()
 
-					if soft_card is not None and not (torch.isnan(soft_card).any() or torch.isinf(soft_card).any()):
-						# 原始MSE蒸馏损失
-						if self.distill_alpha > 0:
-							distill_loss = criterion(output, soft_card)  # MSE for regression
-							# 检查蒸馏损失是否为NaN
+					# Optional knowledge distillation
+					if soft_card is not None and self.distill_alpha > 0:
+						if not (torch.isnan(soft_card).any() or torch.isinf(soft_card).any()):
+							distill_loss = base_criterion(output, soft_card)
 							if not torch.isnan(distill_loss):
 								loss += self.distill_alpha * distill_loss
-								epoch_loss_distill += distill_loss.item()
-							
-						# KL散度蒸馏损失 - 基于区间策略的概率分布（优化版本）
-						if self.distill_kl_alpha > 0:
-							# 使用原始输出进行KL散度计算，确保有batch维度
-							output_for_kl = output_orig.squeeze()
-							if output_for_kl.dim() == 0:
-								output_for_kl = output_for_kl.unsqueeze(0)
-							if soft_card.dim() == 0:
-								soft_card = soft_card.unsqueeze(0)
-							if card.dim() == 0:
-								card_for_kl = card.unsqueeze(0)
-							else:
-								card_for_kl = card
-							
-							# 使用torch操作快速计算min/max（避免.item()调用）
-							all_values = torch.cat([card_for_kl.flatten(), soft_card.flatten(), output_for_kl.flatten()])
-							min_val = all_values.min().item()
-							max_val = all_values.max().item()
-							
-							# 添加边界扩展
-							range_extension = (max_val - min_val) * 0.1
-							min_val -= range_extension
-							max_val += range_extension
-							
-							# 创建bins
-							bins = torch.linspace(min_val, max_val, self.distill_kl_bins + 1).to(card_for_kl.device)
-							
-							# 使用向量化函数计算概率分布（大幅提升性能）
-							teacher_probs = value_to_prob_distribution_vectorized(soft_card, bins)
-							student_probs = value_to_prob_distribution_vectorized(output_for_kl, bins)
-							
-							# 添加小的epsilon值避免log(0)
-							eps = 1e-8
-							teacher_probs = torch.clamp(teacher_probs, eps, 1.0)
-							student_probs = torch.clamp(student_probs, eps, 1.0)
-							
-							# 计算KL散度: D_KL(P||Q) = sum(P * log(P/Q))
-							kl_loss = torch.sum(teacher_probs * torch.log(teacher_probs / student_probs), dim=1).mean()
-							
-							if not torch.isnan(kl_loss):
-								loss += self.distill_kl_alpha * kl_loss
-								epoch_loss_distill_kl += kl_loss.item()
-
-					if self.args.multi_task and self.args.coeff > 0:
-						# 检查分类输出是否有效
-						if output_cla is not None and not (torch.isnan(output_cla).any() or torch.isinf(output_cla).any()):
-							loss_cla = criterion_cal(output_cla, label)
-							# 检查分类损失是否为NaN
-							if not torch.isnan(loss_cla):
-								loss += loss_cla * self.args.coeff
-								epoch_loss_cla += loss_cla.item()
 
 					loss = loss / self.args.batch_size
 
-					# 检查最终损失是否为NaN
 					if torch.isnan(loss):
-						print(f"Warning: NaN detected in final loss. Skipping backward pass.")
+						print(f"Warning: NaN in final loss. Skipping batch.")
 						optimizer.zero_grad()
 						continue
 
-					loss.backward(retain_graph=(self.args.contrastive_weight > 0))
-
-					if self.args.contrastive_weight > 0 and hid_g is not None and hid_g.size(0) > 1:
-						# 确保hid_g不包含NaN
-						if not (torch.isnan(hid_g).any() or torch.isinf(hid_g).any()):
-							loss_con = contrastive_criterion(hid_g, card)
-							# 检查对比损失是否为NaN
-							if not torch.isnan(loss_con):
-								loss += loss_con * self.args.contrastive_weight
-								epoch_loss_con += loss_con.item()
-								loss.backward()
-
+					# Backward and optimize
+					loss.backward()
 					optimizer.step()
 					optimizer.zero_grad()
 
-					# memory update disabled (active-related features removed)
-
-
-					# 存储训练预测（仅最后一次epoch）
-					if epoch == epochs - 1 and self.QD is not None:
-						dataset = train_datasets[loader_idx]
-						query_idx = i * self.args.batch_size
-						if query_idx < len(dataset.queries):
-							query = self.QD.get_query_by_index(self.args.pattern, self.args.size, query_idx)
-							if query is not None:
-								self.QD.update_train_prediction(query, output.item())
-
+				# Learning rate scheduling
 				if scheduler is not None and (epoch + 1) % self.args.decay_patience == 0:
 					scheduler.step()
-				print("{}-th QuerySet, {}-th Epoch: Reg. Loss={:.4f}, Cla. Loss={:.4f}, Distill Loss={:.4f}, Distill KL Loss={:.4f}"
-					  .format(loader_idx, epoch, epoch_loss, epoch_loss_cla, epoch_loss_distill, epoch_loss_distill_kl))
 				
-				# Print memory statistics if memory bank is available
-				if (epoch + 1) % 5 == 0 and model.memory_bank is not None:
-					stats = model.memory_bank.get_statistics()
-					print(f"  Memory Stats: entries={stats['total_entries']}, avg_quality={stats['avg_quality']:.3f}, "
-						  f"success_rate={stats['retrieval_success_rate']:.3f}, threshold={stats['current_threshold']:.3f}")
+				print(f"  {loader_idx}-th QuerySet, {epoch}-th Epoch: Loss={epoch_loss:.4f}")
 
-			# Evaluation the model
-			all_eval_res = self.evaluate(model, criterion, val_datasets, print_res = True)
+			# Evaluate after each loader
+			all_eval_res = self.evaluate(model, criterion, val_datasets, print_res=True)
+		
 		end = datetime.datetime.now()
 		elapse_time = (end - start).total_seconds()
-		print("Training time: {:.4f}s".format(elapse_time))
+		print(f"Training time: {elapse_time:.4f}s")
 		return model, elapse_time
 
 	def evaluate(self, model, criterion, eval_datasets, print_res=False):
+		"""Evaluate model on validation/test datasets."""
 		if self.args.cuda:
 			model.to(self.args.device)
 		model.eval()
+		
 		all_eval_res = []
 		eval_loaders = _to_dataloaders(datasets=eval_datasets)
 		
-		# 创建或加载高误差查询记录文件
-		high_error_log_file = "high_error_queries.log"
+		high_error_log_file = "high_error_queries.log" if hasattr(self.args, 'log_high_error') and self.args.log_high_error else None
 		
 		for loader_idx, dataloader in enumerate(eval_loaders):
 			res = []
 			loss, l1 = 0.0, 0.0
 			start = datetime.datetime.now()
-			for i, (decomp_x, decomp_edge_index, decomp_edge_attr, card, label, soft_card) in \
-					enumerate(dataloader):
-				dataset = eval_datasets[loader_idx]
-				query_idx = i * self.args.batch_size
-				if query_idx >= len(dataset.queries):
-					continue
-				# 移除同构图检查，直接使用模型进行预测
+			
+			for i, batch_data in enumerate(dataloader):
+				# Unpack batch
+				if len(batch_data) == 6:
+					decomp_x, decomp_edge_index, decomp_edge_attr, card, _, soft_card = batch_data
+				else:
+					decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card = batch_data[:5]
+				
 				if self.args.cuda:
-					decomp_x, decomp_edge_index, decomp_edge_attr = \
-						_to_cuda(decomp_x), _to_cuda(decomp_edge_index), _to_cuda(decomp_edge_attr)
-					card, label, soft_card = card.cuda(), label.cuda(), soft_card.cuda()
+					decomp_x = _to_cuda(decomp_x)
+					decomp_edge_index = _to_cuda(decomp_edge_index)
+					decomp_edge_attr = _to_cuda(decomp_edge_attr)
+					card = card.cuda()
+					if soft_card is not None:
+						soft_card = soft_card.cuda()
 				
-				# 直接前向预测（模型不再包含迭代预测逻辑）
+				# Forward pass
 				with torch.no_grad():
-					output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr)
+					output, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr)
 				
-					# 统一处理输出维度
+					# Handle output dimensions
 					if isinstance(output, torch.Tensor):
 						output = output.squeeze()
-						# 如果仍然有多个元素，取均值
 						if output.numel() > 1:
 							output = output.mean()
 				
-				# accumulate loss (works for scalar or batch)
+				# Compute metrics
 				try:
-					loss += criterion(card, output).item()
-				except Exception:
-					# fallback: compute per-sample loss sum
+					loss += criterion(output, card).item()
+				except:
 					loss_batch = criterion(output, card)
 					loss += loss_batch.item() if isinstance(loss_batch, float) else loss_batch.sum().item()
 				
-				# handle scalar (single sample) and batched outputs
+				# Handle single sample or batch
 				if isinstance(output, torch.Tensor) and output.dim() == 0:
-					# single sample
 					true_val = card.item()
 					pred_val = output.item()
 					soft_val = soft_card.item() if soft_card is not None else float('nan')
@@ -342,47 +224,22 @@ class ActiveLearner:
 					l1 += l1_error
 					res.append((true_val, pred_val, soft_val))
 					
-					# log high error if enabled
-					if hasattr(self.args, 'log_high_error') and self.args.log_high_error and l1_error > self.high_error_threshold:
-						query_file_name = "unknown"
-						if self.QD is not None:
-							pattern = self.args.pattern
-							size = self.args.size
-							query_file_name = self.QD.query_file_names.get((pattern, size, query_idx), "unknown")
+					# Log high error queries
+					if high_error_log_file and l1_error > self.high_error_threshold:
 						with open(high_error_log_file, "a") as f:
-							f.write(f"Loader: {loader_idx}, Query Index: {query_idx}, "
-									f"Query File: {query_file_name}, "
-									f"True Card: {true_val:.4f}, Pred Card: {pred_val:.4f}, "
-									f"Soft Card: {soft_val:.4f}, "
-									f"L1 Error: {l1_error:.4f}\n")
+							f.write(f"Loader: {loader_idx}, Query: {i}, "
+									f"True: {true_val:.4f}, Pred: {pred_val:.4f}, "
+									f"Error: {l1_error:.4f}\n")
 				else:
-					# batched outputs
-					batch_size = output.size(0)
-					# card and soft_card should be tensors of shape [batch_size]
+					# Batched outputs
+					batch_size = output.size(0) if output.dim() > 0 else 1
 					for j in range(batch_size):
-						sample_idx = query_idx + j
-						if sample_idx >= len(dataset.queries):
-							continue
-						true_val = card[j].item()
-						pred_val = output[j].item()
-						soft_val = soft_card[j].item() if soft_card is not None else float('nan')
+						true_val = card[j].item() if card.dim() > 0 else card.item()
+						pred_val = output[j].item() if output.dim() > 0 else output.item()
+						soft_val = soft_card[j].item() if (soft_card is not None and soft_card.dim() > 0) else float('nan')
 						l1_error = abs(true_val - pred_val)
 						l1 += l1_error
 						res.append((true_val, pred_val, soft_val))
-						
-						# log high error if enabled
-						if hasattr(self.args, 'log_high_error') and self.args.log_high_error and l1_error > self.high_error_threshold:
-							query_file_name = "unknown"
-							if self.QD is not None:
-								pattern = self.args.pattern
-								size = self.args.size
-								query_file_name = self.QD.query_file_names.get((pattern, size, sample_idx), "unknown")
-							with open(high_error_log_file, "a") as f:
-								f.write(f"Loader: {loader_idx}, Query Index: {sample_idx}, "
-										f"Query File: {query_file_name}, "
-										f"True Card: {true_val:.4f}, Pred Card: {pred_val:.4f}, "
-										f"Soft Card: {soft_val:.4f}, "
-										f"L1 Error: {l1_error:.4f}\n")
 
 			end = datetime.datetime.now()
 			elapse_time = (end - start).total_seconds()
@@ -390,259 +247,5 @@ class ActiveLearner:
 
 		if print_res:
 			print_eval_res(all_eval_res)
-		return all_eval_res
-
-	def active_test(self, model, test_datasets, reject_set = None):
-		if not test_datasets or all(len(dataset) == 0 for dataset in test_datasets):
-			raise ValueError("Test datasets are empty!")
-		print("Test datasets size:", [len(dataset) for dataset in test_datasets])
-		assert self.args.multi_task, "Classification Task Disabled, Cannot Deploy Active Learning!"
-		model.eval()
-		test_uncertainties = []
-		testset_dict = {}
-		for dataset_idx, dataset in enumerate(test_datasets):
-			for i in range(len(dataset)):
-				# skip the test queries in the reject sets
-				if reject_set is not None and (dataset_idx, i) in reject_set:
-					continue
-				decomp_x, decomp_edge_index, decomp_edge_attr, _, _, _ = dataset[i]
-				if self.args.cuda:
-					decomp_x, decomp_edge_index, decomp_edge_attr = \
-						_to_cuda(decomp_x), _to_cuda(decomp_edge_index), _to_cuda(decomp_edge_attr)
-
-				# print(decomp_x)
-				output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr)
-				uncertainty = self.compute_uncertainty(output_cla, output)
-				testset_dict[len(test_uncertainties)] = (dataset_idx, i)
-				test_uncertainties.append(uncertainty)
-		return self.select_active_sets(test_uncertainties, testset_dict, test_datasets)
-	
-	def select_active_sets(self, test_uncertainties, testset_dict, test_datasets):
-		test_uncertainties = np.array(test_uncertainties)
-		if len(test_uncertainties) == 0:
-			return [], []
-        # 避免除零，添加小值平滑
-		test_uncertainties = test_uncertainties + 1e-10
-		test_uncertainties = test_uncertainties / np.sum(test_uncertainties)
-		num_selected = min(self.budget, len(test_uncertainties))  # 动态调整
-		if self.biased_sample:
-            # 过滤零概率
-			non_zero_indices = np.where(test_uncertainties > 0)[0]
-			if len(non_zero_indices) < num_selected:
-				print(f"Warning: Only {len(non_zero_indices)} non-zero uncertainties, selecting all")
-				indices = non_zero_indices
-			else:
-				indices = np.random.choice(non_zero_indices, size=num_selected, replace=False,
-                                         p=test_uncertainties[non_zero_indices]/np.sum(test_uncertainties[non_zero_indices]))
-		else:
-			indices = np.argsort(test_uncertainties)[-num_selected:]
-		selected_set = [testset_dict[idx] for idx in indices]
-		active_sets = []
-		for dataset_idx, i in selected_set:
-			decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card = test_datasets[dataset_idx].queries[i]
-			active_sets.append((decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card))
-			return active_sets, selected_set
-
-
-	def compute_uncertainty(self, output_cal, output):
-		assert self.uncertainty == "entropy" or self.uncertainty == "confident" or self.uncertainty == "margin" \
-			   or self.uncertainty == "random" or self.uncertainty == "consist", \
-			"Unsupported uncertainty criterion"
-		output_cal, output = output_cal.squeeze(), output.squeeze()
-		output_cal = torch.exp(output_cal) # transform to probability
-		if self.args.cuda:
-			output_cal = output_cal.cpu()
-			output = output.cpu()
-		output = output.item()
-		output_cal = output_cal.detach().numpy()
-		if self.uncertainty == "entropy":
-			return entropy(output_cal)
-		elif self.uncertainty == "confident":
-			return 1.0 - np.max(output_cal)
-		elif self.uncertainty == "margin":
-			res = output_cal[np.argsort(output_cal)[-1]] - output_cal[np.argsort(output_cal)[-2]]
-			return res
-		elif self.uncertainty == "random":
-			return random.random()
-		elif self.uncertainty == "consist":
-			reg_mag = math.ceil( math.log10( math.pow(2, output)))
-			cla_mag = np.argmax(output_cal)
-			return math.pow((reg_mag - cla_mag), 2)
-
-	def merge_datasets(self, train_datasets, active_sets):
-		active_train_datasets = []
-		for dataset in train_datasets:
-			active_train_datasets += dataset.queries
-		active_train_datasets += active_sets
-		return _to_datasets([active_train_datasets])
-
-	def print_selected_set_info(self, selected_set):
-		cnt_dict = {}
-		for dataset_idx, i in selected_set:
-			if dataset_idx not in cnt_dict.keys():
-				cnt_dict[dataset_idx] = 0
-			cnt_dict[dataset_idx] += 1
-		print("Selected set info: # Selected Queries: {}".format(len(selected_set)))
-		for key in sorted(cnt_dict.keys()):
-			print("# Select Query in {}-th Test set: {}.".format(key, cnt_dict[key]))
-
-
-	def active_train(self, model, criterion, criterion_cla, train_datasets, val_datasets, test_datasets, optimizer, scheduler=None, pretrain=True):
-		reject_set = []
-		if pretrain:
-			model, _ = self.train(model, criterion, criterion_cla, train_datasets, val_datasets, optimizer, scheduler, active=False)
-			active_train_datasets = train_datasets
-		for iter in range(self.active_iters):
-			active_sets, selected_set = self.active_test(model, test_datasets, reject_set)
-			if not active_sets:
-				print(f"Skipping active learning iteration {iter} due to empty active_sets")
-				continue
-			reject_set += selected_set
-			print("reject set size: {}".format(len(reject_set)))
-			self.print_selected_set_info(reject_set)
-			active_train_datasets = self.merge_datasets(train_datasets, active_sets)
-			# 更新 train_graphs for active sets
-			if self.QD is not None:
-				for idx, (query, true_card) in enumerate(active_sets):
-					graph_key = self.QD.serialize_graph(query)
-					self.QD.train_graphs[graph_key] = {"graph": query, "pred": None}
-					self.QD.query_indices[(self.args.pattern, self.args.size, len(self.QD.all_queries[(self.args.pattern, self.args.size)]) + idx)] = query
-			print("The {}-th active Learning.".format(iter))
-			model, _ = self.train(model, criterion, criterion_cla, active_train_datasets, val_datasets, optimizer, scheduler, active=True)
-
-
-	def ensemble_evaluate(self, models, criterion, eval_datasets, print_res = False):
-		"""
-		get the final result of the ensemble models
-		"""
-		for model in models:
-			if self.args.cuda:
-				model.to(self.args.device)
-			model.eval()
-		all_eval_res = []
-		eval_loaders = _to_dataloaders(datasets=eval_datasets)
 		
-		# 创建或加载高误差查询记录文件
-		high_error_log_file = "high_error_queries_ensemble.log"
-		
-		for loader_idx, dataloader in enumerate(eval_loaders):
-			res = []
-			loss, l1 = 0.0, 0.0
-			start = datetime.datetime.now()
-			for i, (decomp_x, decomp_edge_index, decomp_edge_attr, card, label, soft_card) in \
-					enumerate(dataloader):
-				if self.args.cuda:
-					decomp_x, decomp_edge_index, decomp_edge_attr = \
-						_to_cuda(decomp_x), _to_cuda(decomp_edge_index), _to_cuda(decomp_edge_attr)
-					card, label, soft_card = card.cuda(), label.cuda(), soft_card.cuda()
-
-				# get the ensemble result
-				outputs, losses, l1s = [], [], []
-				for model in models:
-					output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr, card)
-					output = output.squeeze()
-					outputs.append(output.item())
-					losses.append(criterion(card, output).item())
-					l1s.append(torch.abs(card - output).item())
-				#print(outputs, losses, l1s)
-				geo_output = gmean(outputs)
-				loss += np.mean(losses)
-				l1_error = np.mean(l1s)
-				l1 += l1_error
-
-				res.append((card.item(), geo_output, soft_card.item()))
-				
-				# 记录高误差查询（如果启用）
-				if hasattr(self.args, 'log_high_error') and self.args.log_high_error and l1_error > self.high_error_threshold:
-					# 获取查询文件名
-					query_file_name = "unknown"
-					if self.QD is not None:
-						# 根据loader_idx和query_idx获取查询
-						pattern = self.args.pattern
-						size = self.args.size
-						query = self.QD.get_query_by_index(pattern, size, i)
-						if query is not None:
-							# 查找对应的查询文件名
-							for idx, q in self.QD.query_indices.items():
-								if idx[0] == pattern and idx[1] == size and self.QD.is_isomorphic(query, q):
-									query_file_name = f"{pattern}_{size}_{idx[2]}"
-									break
-					
-					with open(high_error_log_file, "a") as f:
-						f.write(f"Loader: {loader_idx}, Query Index: {i}, "
-								f"Query File: {query_file_name}, "
-								f"True Card: {card.item():.4f}, Pred Card: {geo_output:.4f}, "
-								f"L1 Error: {l1_error:.4f}\n")
-								
-			end = datetime.datetime.now()
-			elapse_time = (end - start).total_seconds()
-			all_eval_res.append((res, loss, l1, elapse_time))
-
-		if print_res:
-			print_eval_res(all_eval_res)
 		return all_eval_res
-
-
-
-	def ensemble_active_test(self, models, test_datasets, reject_set = None):
-
-		for model in models:
-			model.eval()
-		test_uncertainties = []
-		testset_dict = {}
-		for dataset_idx, dataset in enumerate(test_datasets):
-			for i in range(len(dataset)):
-				# skip the test queries in the reject sets
-				if reject_set is not None and (dataset_idx, i) in reject_set:
-					continue
-				decomp_x, decomp_edge_index, decomp_edge_attr, card, label, soft_card = dataset[i]
-				if self.args.cuda:
-					decomp_x, decomp_edge_index, decomp_edge_attr = \
-						_to_cuda(decomp_x), _to_cuda(decomp_edge_index), _to_cuda(decomp_edge_attr)
-					card, label, soft_card = card.cuda(), label.cuda(), soft_card.cuda()
-
-				outputs = []
-				for model in models:
-					output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr, card)
-					output = output.squeeze()
-					if self.args.cuda:
-						output = output.cpu()
-					outputs.append(output.item())
-				# uncertainty is the ensemble variance
-				uncertainty = np.var(outputs)
-				testset_dict[len(test_uncertainties)] = (dataset_idx, i)
-				test_uncertainties.append(uncertainty)
-		return self.select_active_sets(test_uncertainties, testset_dict, test_datasets)
-
-
-	def ensemble_active_train(self, models, criterion, criterion_cla, train_datasets, val_datasets, test_datasets, optimizers, schedulers = None, pretrain = True):
-
-		cur_models = []
-		reject_set = []
-
-		if pretrain: # pretrain all ensembled models
-			for model, optimizer, scheduler in zip(models, optimizers, schedulers):
-				model, _ = self.train(model, criterion, criterion_cla, train_datasets, val_datasets, optimizer, scheduler, active = False)
-				cur_models.append(model)
-
-		print("Ensemble Eval Result of {} Models:".format(len(cur_models)))
-		self.ensemble_evaluate(cur_models, criterion, val_datasets, print_res=True)
-		for iter in range(self.active_iters):
-			active_sets, selected_set = self.ensemble_active_test(cur_models, test_datasets, reject_set)
-
-			# merge the reject set
-			reject_set += selected_set
-			print("reject set size: {}".format(len(reject_set)))
-			self.print_selected_set_info(reject_set)
-
-			active_train_datasets = self.merge_datasets(train_datasets, active_sets)
-			print("The {}-th active Learning.".format(iter))
-
-			tmp_models = []
-			for model, optimizer, scheduler in zip(cur_models, optimizers, schedulers):
-				model, _ = self.train(model, criterion, criterion_cla, active_train_datasets, val_datasets, optimizer,
-								  	scheduler, active=True)
-				tmp_models.append(model)
-			cur_models = tmp_models
-			print("Ensemble Eval Result of {} Models:".format(len(cur_models)))
-			self.ensemble_evaluate(cur_models, criterion, val_datasets, print_res=True)

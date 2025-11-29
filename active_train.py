@@ -20,7 +20,6 @@ def main(args):
 	true_card_dir = args.true_card_dir
 	dataset = args.dataset
 	data_dir = args.data_dir
-	num_classes = args.max_classes
 	pattern = args.pattern
 
 	# optimizer parameter
@@ -28,90 +27,6 @@ def main(args):
 	weight_decay = args.weight_decay
 	decay_factor = args.decay_factor
 
-
-
-	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern=pattern, k=args.k, size=args.size)
-	# decompose the query
-	if args.use_parallel:
-		print(f"Using parallel processing for query decomposition with {args.num_workers} workers...")
-		QD.decompose_queries_parallel(num_workers=args.num_workers)
-	else:
-		print("Using sequential processing for query decomposition...")
-		QD.decompose_queries()
-	all_subsets = QD.all_subsets
-
-	QS = Queryset(args= args, all_subsets=all_subsets)
-
-	num_node_feat = QS.num_node_feat
-	num_edge_feat = QS.num_edge_feat
-	QS.print_queryset_info()
-
-	train_sets, val_sets, test_sets, all_train_sets = QS.train_sets, QS.val_sets, QS.test_sets, QS.all_train_sets
-	train_datasets = _to_datasets(train_sets, num_classes) if args.cumulative else _to_datasets(all_train_sets, num_classes)
-	val_datasets, test_datasets, = _to_datasets(val_sets, num_classes), _to_datasets(test_sets, num_classes)
-
-	# Create memory bank if requested
-	memory_bank = None
-	if hasattr(args, 'memory_size') and args.memory_size > 0:
-		from cardnet.improved_memory import ImprovedQueryMemoryBank
-		# We need to create model first to get embedding_dim, or use a placeholder
-		# For now, create a temporary model to infer dimension
-		temp_model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
-		embedding_dim = temp_model.encoder.mlp_in_ch
-		memory_bank = ImprovedQueryMemoryBank(
-			embedding_dim=embedding_dim,
-			memory_size=args.memory_size,
-			high_quality_ratio=getattr(args, 'memory_hq_ratio', 0.7),
-			temperature=getattr(args, 'memory_temperature', 0.1),
-			base_similarity_threshold=getattr(args, 'memory_threshold', 0.85)
-		)
-		print(f"Created memory bank: size={args.memory_size}, embedding_dim={embedding_dim}")
-		del temp_model
-
-	model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat, memory_bank=memory_bank)
-	print(model)
-	criterion = torch.nn.MSELoss()
-	criterion_cla = torch.nn.NLLLoss()
-	optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-	scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_factor)
-
-	active_learner = ActiveLearner(args, QD=QD)
-	if args.mode == "train":
-		print("start active learning ...")
-		#load_model(args=args, model=model, device=args.device, optimizer=optimizer)
-		active_learner.active_train(model=model, criterion=criterion, criterion_cla=criterion_cla,
-								train_datasets=train_datasets, val_datasets=val_datasets, test_datasets=test_datasets,
-								optimizer=optimizer, scheduler=scheduler, pretrain=True)
-		model_checkpoint(args=args, model=model, optimizer=optimizer, scheduler=scheduler)
-
-	elif args.mode == "pretrain":
-		active_learner.active_train(model=model, criterion=criterion, criterion_cla=criterion_cla,
-									train_datasets=train_datasets, val_datasets=val_datasets,
-									test_datasets=test_datasets,
-									optimizer=optimizer, scheduler=scheduler, pretrain=True)
-		model_checkpoint(args=args, model=model, optimizer=optimizer, scheduler=scheduler)
-
-	elif args.mode == "test":
-		print("loading model ...")
-		load_model(args = args, model=model, device=args.device, optimizer= optimizer)
-		print("make prediction ...")
-		active_learner.evaluate(model=model, criterion= criterion, eval_datasets=val_datasets, print_res=True)
-
-def ensemble_learn(args):
-	"""
-	Entrance of Ensemble active learning
-	"""
-	# input dir
-	queryset_dir = args.queryset_dir
-	true_card_dir = args.true_card_dir
-	dataset = args.dataset
-	data_dir = args.data_dir
-	pattern = args.pattern
-
-	# optimizer parameter
-	lr = args.learning_rate
-	weight_decay = args.weight_decay
-	decay_factor = args.decay_factor
 
 
 	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern=pattern, k=args.k, size=args.size)
@@ -132,57 +47,51 @@ def ensemble_learn(args):
 
 	train_sets, val_sets, test_sets, all_train_sets = QS.train_sets, QS.val_sets, QS.test_sets, QS.all_train_sets
 	train_datasets = _to_datasets(train_sets) if args.cumulative else _to_datasets(all_train_sets)
-	val_datasets, test_datasets, = _to_datasets(val_sets), _to_datasets(test_sets)
+	val_datasets, test_datasets = _to_datasets(val_sets), _to_datasets(test_sets)
 
-	# Create memory bank for ensemble (optional, typically not used)
-	memory_bank = None
-	if hasattr(args, 'memory_size') and args.memory_size > 0:
-		from cardnet.improved_memory import ImprovedQueryMemoryBank
-		temp_model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
-		embedding_dim = temp_model.encoder.mlp_in_ch
-		memory_bank = ImprovedQueryMemoryBank(
-			embedding_dim=embedding_dim,
-			memory_size=args.memory_size,
-			high_quality_ratio=getattr(args, 'memory_hq_ratio', 0.7),
-			temperature=getattr(args, 'memory_temperature', 0.1),
-			base_similarity_threshold=getattr(args, 'memory_threshold', 0.85)
-		)
-		print(f"Created shared memory bank for ensemble: size={args.memory_size}, embedding_dim={embedding_dim}")
-		del temp_model
-
-	models = []
-	for _ in range(args.ensemble_num):
-		models.append(cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat, memory_bank=memory_bank))
-
+	# Create model (simplified - no memory bank, no classification)
+	model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
+	print(model)
+	
+	# Only regression loss
 	criterion = torch.nn.MSELoss()
-	criterion_cla = torch.nn.NLLLoss()
-	optimizers = [ optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay) for model in models]
-	schedulers = [ optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_factor) for optimizer in optimizers]
+	optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+	scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_factor)
 
 	active_learner = ActiveLearner(args, QD=QD)
-	active_learner.ensemble_active_train(models, criterion,criterion_cla,
-										 train_datasets, val_datasets, test_datasets, optimizers, schedulers, pretrain=True)
+	
+	if args.mode == "train":
+		print("Starting training...")
+		model, _ = active_learner.train(model, criterion, train_datasets, val_datasets, optimizer, scheduler)
+		file_name = model_checkpoint(args, model, optimizer, scheduler)
+		print(f"Model saved to: {file_name}")
 
+	elif args.mode == "pretrain":
+		print("Starting pretraining...")
+		model, _ = active_learner.train(model, criterion, train_datasets, val_datasets, optimizer, scheduler)
+		file_name = model_checkpoint(args, model, optimizer, scheduler, model_dir="model_pretrain.pth")
+		print(f"Pretrained model saved to: {file_name}")
 
+	elif args.mode == "test":
+		print("Loading model...")
+		load_model(args=args, model=model, device=args.device, optimizer=optimizer)
+		print("Making predictions...")
+		active_learner.evaluate(model=model, criterion=criterion, eval_datasets=test_datasets, print_res=True)
 
 def cross_validate(args):
 	"""
 	Entrance of cross validation, without active learning
 	"""
-	# input dir
 	queryset_dir = args.queryset_dir
 	true_card_dir = args.true_card_dir
 	dataset = args.dataset
-	num_classes = args.max_classes
 	pattern = args.pattern
-
-	# optimizer parameter
+	
 	lr = args.learning_rate
 	weight_decay = args.weight_decay
 	decay_factor = args.decay_factor
 
 	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern=pattern, k=args.k, size=args.size)
-	# decompose the query
 	if args.use_parallel:
 		print(f"Using parallel processing for query decomposition with {args.num_workers} workers...")
 		QD.decompose_queries_parallel(num_workers=args.num_workers)
@@ -195,11 +104,10 @@ def cross_validate(args):
 	num_node_feat = QS.num_node_feat
 	num_edge_feat = QS.num_edge_feat
 	QS.print_queryset_info()
-	all_sizes = QS.all_sizes # {size -> (graphs, card)}
+	all_sizes = QS.all_sizes
 	all_fold_train_sets, all_fold_val_sets = data_split_cv(all_sizes, num_fold=args.num_fold)
 
 	criterion = torch.nn.MSELoss()
-	criterion_cla = torch.nn.NLLLoss()
 	active_learner = ActiveLearner(args, QD=QD)
 	all_fold_val_res = None
 	i = 0
@@ -207,31 +115,15 @@ def cross_validate(args):
 	for train_sets, val_sets in zip(all_fold_train_sets, all_fold_val_sets):
 		i += 1
 		print("start the {}/{} fold training ...".format(i, args.num_fold))
-		train_datasets, val_datasets = _to_datasets([train_sets], num_classes), _to_datasets(val_sets, num_classes)
+		train_datasets, val_datasets = _to_datasets([train_sets]), _to_datasets(val_sets)
 		
-		# Create fresh memory bank for each fold
-		memory_bank = None
-		if hasattr(args, 'memory_size') and args.memory_size > 0:
-			from cardnet.improved_memory import ImprovedQueryMemoryBank
-			temp_model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
-			embedding_dim = temp_model.encoder.mlp_in_ch
-			memory_bank = ImprovedQueryMemoryBank(
-				embedding_dim=embedding_dim,
-				memory_size=args.memory_size,
-				high_quality_ratio=getattr(args, 'memory_hq_ratio', 0.7),
-				temperature=getattr(args, 'memory_temperature', 0.1),
-				base_similarity_threshold=getattr(args, 'memory_threshold', 0.85)
-			)
-			print(f"Fold {i}: Created memory bank with size={args.memory_size}, embedding_dim={embedding_dim}")
-			del temp_model
-		
-		model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat, memory_bank=memory_bank)
+		model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
 		print(model)
 		optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 		scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_factor)
-		_, fold_elapse_time = active_learner.train(model=model, criterion=criterion, criterion_cal=criterion_cla,
+		_, fold_elapse_time = active_learner.train(model=model, criterion=criterion,
 									train_datasets=train_datasets, val_datasets=val_datasets,
-									optimizer=optimizer, scheduler=scheduler, active=False)
+									optimizer=optimizer, scheduler=scheduler)
 		total_elapse_time += fold_elapse_time
 		fold_eval_res = active_learner.evaluate(model=model, criterion=criterion, eval_datasets=val_datasets)
 		# merge the result of the evaluation result of each fold
@@ -334,42 +226,20 @@ if __name__ == "__main__":
 						help='Disables CUDA training.')
 	parser.add_argument('--num_workers', type=int, default=8,
 						help='Number of worker processes for parallel processing and Dataset workers')
-	# Classification task settings
-	parser.add_argument("--multi_task", default=True, type=bool,
-						help="enable/disable card classification task.")
-	parser.add_argument("--max_classes", default=10, type=int,
-						help="number classes for the card classification task.")
-	parser.add_argument('--coeff', type=float, default=0.3,
-						help='coefficient for the classification loss.')
+	
+	# ===== Simplified: Removed classification and active learning parameters =====
+	# Classification task has been removed to simplify the model
+	# Active learning has been removed to focus on core cardinality estimation
+	
+	# Knowledge distillation settings (optional)
+	parser.add_argument("--distill_alpha", type=float, default=0.0,
+						help="Coefficient for knowledge distillation (0 to disable)")
 	parser.add_argument("--pattern", type=str, default='query',
-					help="Specific pattern_size to load (e.g., query_4 query_8)")
-	parser.add_argument("--size", type=int, default=8)
-	# Improved Memory Bank settings
-	parser.add_argument('--use_improved_memory', action='store_true',
-						help='Use improved query memory bank (recommended)')
-	parser.add_argument('--high_quality_ratio', type=float, default=0.7,
-						help='Ratio of high-quality memory zone (default: 0.7)')
-	parser.add_argument('--memory_temperature', type=float, default=0.1,
-						help='Temperature for memory attention (default: 0.1)')
-	parser.add_argument('--base_similarity_threshold', type=float, default=0.85,
-						help='Base similarity threshold (default: 0.85, will be adapted)')
-	parser.add_argument("--distill_alpha", type=float, default=0.5)
-	parser.add_argument("--distill_kl_alpha", type=float, default=0.2)
-	parser.add_argument("--distill_kl_bins", type=int, default=10)
-	# Active Learner settings
-	parser.add_argument("--uncertainty", default="consist", type=str,
-						help="The uncertainty type") # entropy, margin, confident, consist, random are tested
-	parser.add_argument("--biased_sample", default=True, type=bool,
-						help="Enable Biased sampling for test set selection")
-	parser.add_argument('--active_iters', type=int, default=5,
-						help='Num of iterators of active learning.')
-	parser.add_argument('--budget', type=int, default=50,
-						help='Selected Queries budget Per Iteration.')
-	parser.add_argument('--active_epochs', type=int, default=50,
-						help='Training Epochs for per iteration active learner.')
-	parser.add_argument('--ensemble_num', type=int, default=5,
-						help='number of ensemble models for active learning.')
-	# Contrastive Learning settings
+						help="Specific pattern_size to load (e.g., query_4 query_8)")
+	parser.add_argument("--size", type=int, default=8,
+						help="Query graph size")
+	
+	# Contrastive Learning settings (optional - usually not needed) (optional)
 	parser.add_argument('--contrastive_weight', type=float, default=0.01,
 						help='Weight for the contrastive loss.')
 	parser.add_argument('--cardinality_threshold', type=float, default=1.5,
@@ -416,7 +286,6 @@ if __name__ == "__main__":
 		args.prone_feat_dir
 	if args.embed_type == "nrp":
 		args.embed_feat_dir = args.nrp_feat_dir
-	args.active_iters = 0 if args.mode == "pretrain" else args.active_iters
 	args.queryset_dir = args.queryset_homo_dir if args.matching == "homo" else  args.queryset_iso_dir
 	args.true_card_dir = args.true_homo_dir if args.matching == "homo" else args.true_iso_dir
 
@@ -426,7 +295,5 @@ if __name__ == "__main__":
 		print(args)
 	if args.mode == "cross_val":
 		cross_validate(args)
-	elif args.mode == "ensemble":
-		ensemble_learn(args)
 	else: # train/test/pre-train
 		main(args)

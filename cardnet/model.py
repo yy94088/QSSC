@@ -8,12 +8,11 @@ from .predictor import Predictor
 
 
 class CardNet(nn.Module):
-    """Thin wrapper that composes a CardEncoder and a Predictor.
-
-    This preserves the previous `CardNet` external API while making
-    encoding and prediction separable for future refactors.
+    """Graph neural network for query cardinality estimation.
+    
+    Composes a CardEncoder and a Predictor for end-to-end learning.
     """
-    def __init__(self, args, num_node_feat, num_edge_feat, memory_bank=None):
+    def __init__(self, args, num_node_feat, num_edge_feat):
         super(CardNet, self).__init__()
         self.num_node_feat = num_node_feat
         self.num_edge_feat = num_edge_feat
@@ -21,21 +20,14 @@ class CardNet(nn.Module):
         self.out_g_ch = args.out_g_ch
         self.num_att_hid = args.num_att_hid
         self.num_mlp_hid = args.num_mlp_hid
-        self.num_classes = args.max_classes
-        self.multi_task = args.multi_task
         self.pool_type = args.pool_type
 
-        # Encoder handles graph convs, pooling/attention and returns a single feature vector
+        # Encoder: graph convolutions + pooling
         self.encoder = CardEncoder(args, self.num_node_feat, self.num_edge_feat)
         predictor_in_ch = self.encoder.mlp_in_ch
 
-        # Keep reference to optional memory bank and pass it to the predictor
-        self.memory_bank = memory_bank
-
-        # Predictor handles regression/classification heads (optionally memory-augmented)
-        self.predictor = Predictor(in_ch=predictor_in_ch, num_mlp_hid=self.num_mlp_hid,
-                       num_classes=self.num_classes, multi_task=self.multi_task,
-                       memory_bank=self.memory_bank)
+        # Predictor: regression head only
+        self.predictor = Predictor(in_ch=predictor_in_ch, num_mlp_hid=self.num_mlp_hid)
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -48,12 +40,24 @@ class CardNet(nn.Module):
         elif isinstance(module, nn.Parameter):
             nn.init.uniform_(module, -0.1, 0.1)
 
-    def forward(self, decomp_x, decomp_edge_index, decomp_edge_attr, card=None):
-        # Encode
+    def forward(self, decomp_x, decomp_edge_index, decomp_edge_attr):
+        """
+        Forward pass for cardinality estimation.
+        
+        Args:
+            decomp_x: List of node feature tensors for decomposed subgraphs
+            decomp_edge_index: List of edge index tensors
+            decomp_edge_attr: List of edge attribute tensors
+        
+        Returns:
+            output: Predicted log cardinality
+            hid: Hidden representation from encoder
+        """
+        # Encode graph structure
         x = self.encoder(decomp_x, decomp_edge_index, decomp_edge_attr)
 
-        # Predict
-        output, output_cla, hid = self.predictor(x)
+        # Predict cardinality
+        output, hid = self.predictor(x)
 
-        return output, output_cla, x
+        return output, x
 

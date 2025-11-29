@@ -14,8 +14,8 @@ def _to_cuda(l):
 	return [t.cuda() for t in l]
 
 
-def _to_datasets(all_sets, num_classes = 10):
-	datasets = [QueryDataset(queries=queries, num_classes=10)
+def _to_datasets(all_sets):
+	datasets = [QueryDataset(queries=queries)
 				for queries in all_sets ] if isinstance(all_sets, list) \
 		else [ QueryDataset(queries=all_sets) ]
 	return datasets

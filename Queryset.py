@@ -365,15 +365,12 @@ class DataGraph(object):
 
 
 class QueryDataset(Dataset):
-	def __init__(self, queries, num_classes = 10):
+	def __init__(self, queries):
 		"""
 		parameter:
 		all_queries =[(decomp_x, decomp_edge_attr, decomp_edge_attr, card)]
-		num_classes: number of classes for the classification task
 		"""
 		self.queries = queries
-		self.label_base = 10
-		self.num_classes = num_classes
 
 	def __len__(self):
 		return len(self.queries)
@@ -389,10 +386,7 @@ class QueryDataset(Dataset):
 			# 使用一个小的正值代替无效值
 			card = 1.0
 			
-		idx = math.ceil(math.log(card, self.label_base))
-		idx = self.num_classes - 1 if idx >= self.num_classes else idx
 		card = torch.tensor(math.log(card, 2), dtype=torch.float)
-		label = torch.tensor(idx, dtype=torch.long)
 		
 		# 处理soft_card可能为0或负数的情况
 		if soft_card is None or soft_card <= 0 or math.isnan(soft_card) or math.isinf(soft_card):
@@ -400,7 +394,7 @@ class QueryDataset(Dataset):
 		else:
 			soft_card = torch.tensor(math.log(soft_card, 2), dtype=torch.float)
 
-		return decomp_x, decomp_edge_index, decomp_edge_attr, card, label, soft_card
+		return decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card
 
 
 
