@@ -10,6 +10,69 @@ class MLLLoss(nn.Module):
 	def forward(self, mu, sigma, target):
 		return 0.5 * ( torch.log(torch.pow(sigma, 2)) + torch.pow((mu - target), 2) / torch.pow(sigma, 2))
 
+class QErrorLoss(nn.Module):
+    """
+    Q-Error感知的损失函数，专门为基数估计设计
+    Q-Error = max(pred/true, true/pred)
+    这个损失函数对低估和高估都敏感，更符合查询优化器的需求
+    """
+    def __init__(self, epsilon=1e-8):
+        super(QErrorLoss, self).__init__()
+        self.epsilon = epsilon
+    
+    def forward(self, pred, target):
+        """
+        Args:
+            pred: 预测的log基数
+            target: 真实的log基数
+        """
+        # 转换为实际基数（避免log空间的计算问题）
+        pred_card = torch.exp(pred) + self.epsilon
+        true_card = torch.exp(target) + self.epsilon
+        
+        # 计算Q-Error: max(pred/true, true/pred)
+        q_error = torch.maximum(pred_card / true_card, true_card / pred_card)
+        
+        # 返回log(Q-Error)的均值，这样梯度更稳定
+        loss = torch.log(q_error).mean()
+        
+        return loss
+
+
+class AdaptiveWeightedMSELoss(nn.Module):
+    """
+    自适应加权MSE损失
+    对不同基数范围的查询给予不同的权重
+    小基数查询：更高权重（因为更常见，更重要）
+    大基数查询：适中权重（防止模型过度关注极端值）
+    """
+    def __init__(self, weight_exp=1.0):
+        super(AdaptiveWeightedMSELoss, self).__init__()
+        self.weight_exp = weight_exp
+    
+    def forward(self, pred, target):
+        """
+        Args:
+            pred: 预测的log基数
+            target: 真实的log基数
+        """
+        # 计算基础MSE
+        mse = (pred - target) ** 2
+        
+        # 自适应权重：根据真实基数大小
+        # 小基数：权重高；大基数：权重低
+        # weight = 1 / (1 + |target|^weight_exp)
+        weights = 1.0 / (1.0 + torch.abs(target) ** self.weight_exp)
+        
+        # 归一化权重
+        weights = weights / weights.mean()
+        
+        # 加权MSE
+        weighted_mse = (mse * weights).mean()
+        
+        return weighted_mse
+
+
 class ContrastiveLoss(nn.Module):
     """
     基于基数的对比学习损失。
@@ -19,7 +82,7 @@ class ContrastiveLoss(nn.Module):
         """
         Args:
             temperature (float): 温度参数，控制相似度分布的锐利程度。
-            cardinality_threshold (float): 定义“基数相近”的阈值（在log尺度上）。
+            cardinality_threshold (float): 定义"基数相近"的阈值（在log尺度上）。
         """
         super(ContrastiveLoss, self).__init__()
         self.temperature = temperature

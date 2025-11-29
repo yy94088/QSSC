@@ -50,7 +50,25 @@ def main(args):
 	train_datasets = _to_datasets(train_sets, num_classes) if args.cumulative else _to_datasets(all_train_sets, num_classes)
 	val_datasets, test_datasets, = _to_datasets(val_sets, num_classes), _to_datasets(test_sets, num_classes)
 
-	model = cardnet.CardNet(args, num_node_feat= num_node_feat, num_edge_feat = num_edge_feat)
+	# Create memory bank if requested
+	memory_bank = None
+	if hasattr(args, 'memory_size') and args.memory_size > 0:
+		from cardnet.improved_memory import ImprovedQueryMemoryBank
+		# We need to create model first to get embedding_dim, or use a placeholder
+		# For now, create a temporary model to infer dimension
+		temp_model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
+		embedding_dim = temp_model.encoder.mlp_in_ch
+		memory_bank = ImprovedQueryMemoryBank(
+			embedding_dim=embedding_dim,
+			memory_size=args.memory_size,
+			high_quality_ratio=getattr(args, 'memory_hq_ratio', 0.7),
+			temperature=getattr(args, 'memory_temperature', 0.1),
+			base_similarity_threshold=getattr(args, 'memory_threshold', 0.85)
+		)
+		print(f"Created memory bank: size={args.memory_size}, embedding_dim={embedding_dim}")
+		del temp_model
+
+	model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat, memory_bank=memory_bank)
 	print(model)
 	criterion = torch.nn.MSELoss()
 	criterion_cla = torch.nn.NLLLoss()
@@ -116,9 +134,25 @@ def ensemble_learn(args):
 	train_datasets = _to_datasets(train_sets) if args.cumulative else _to_datasets(all_train_sets)
 	val_datasets, test_datasets, = _to_datasets(val_sets), _to_datasets(test_sets)
 
+	# Create memory bank for ensemble (optional, typically not used)
+	memory_bank = None
+	if hasattr(args, 'memory_size') and args.memory_size > 0:
+		from cardnet.improved_memory import ImprovedQueryMemoryBank
+		temp_model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
+		embedding_dim = temp_model.encoder.mlp_in_ch
+		memory_bank = ImprovedQueryMemoryBank(
+			embedding_dim=embedding_dim,
+			memory_size=args.memory_size,
+			high_quality_ratio=getattr(args, 'memory_hq_ratio', 0.7),
+			temperature=getattr(args, 'memory_temperature', 0.1),
+			base_similarity_threshold=getattr(args, 'memory_threshold', 0.85)
+		)
+		print(f"Created shared memory bank for ensemble: size={args.memory_size}, embedding_dim={embedding_dim}")
+		del temp_model
+
 	models = []
 	for _ in range(args.ensemble_num):
-		models.append(cardnet.CardNet(args, num_node_feat= num_node_feat, num_edge_feat = num_edge_feat))
+		models.append(cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat, memory_bank=memory_bank))
 
 	criterion = torch.nn.MSELoss()
 	criterion_cla = torch.nn.NLLLoss()
@@ -174,7 +208,24 @@ def cross_validate(args):
 		i += 1
 		print("start the {}/{} fold training ...".format(i, args.num_fold))
 		train_datasets, val_datasets = _to_datasets([train_sets], num_classes), _to_datasets(val_sets, num_classes)
-		model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
+		
+		# Create fresh memory bank for each fold
+		memory_bank = None
+		if hasattr(args, 'memory_size') and args.memory_size > 0:
+			from cardnet.improved_memory import ImprovedQueryMemoryBank
+			temp_model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
+			embedding_dim = temp_model.encoder.mlp_in_ch
+			memory_bank = ImprovedQueryMemoryBank(
+				embedding_dim=embedding_dim,
+				memory_size=args.memory_size,
+				high_quality_ratio=getattr(args, 'memory_hq_ratio', 0.7),
+				temperature=getattr(args, 'memory_temperature', 0.1),
+				base_similarity_threshold=getattr(args, 'memory_threshold', 0.85)
+			)
+			print(f"Fold {i}: Created memory bank with size={args.memory_size}, embedding_dim={embedding_dim}")
+			del temp_model
+		
+		model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat, memory_bank=memory_bank)
 		print(model)
 		optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 		scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_factor)
@@ -232,10 +283,32 @@ if __name__ == "__main__":
 						help='shards pooling layer type')
 	parser.add_argument('--dropout', type=float, default=0.2,
 						help='Dropout rate (1 - keep probability).')
-	parser.add_argument('--memory_size', type=int, default=100,
-						help='Size of the query memory bank. 0 means disabled.')
+	parser.add_argument('--memory_size', type=int, default=0,
+						help='Size of the query memory bank. 0 means disabled (DEPRECATED, use new methods instead).')
 	parser.add_argument('--similarity_threshold', type=float, default=0.7,
 						help='Similarity threshold for memory retrieval and update.')
+	
+	# ===== 新增：改进的损失函数和训练策略 =====
+	parser.add_argument('--loss_type', type=str, default='mse',
+						choices=['mse', 'qerror', 'weighted_mse', 'hybrid'],
+						help='Loss function type: mse (default), qerror (Q-Error aware), weighted_mse (adaptive weighted), hybrid (combination)')
+	parser.add_argument('--use_residual', action='store_true', default=True,
+						help='Use residual connections in GNN (recommended for better gradient flow)')
+	parser.add_argument('--use_layer_norm', action='store_true', default=True,
+						help='Use layer normalization in GNN (recommended for training stability)')
+	parser.add_argument('--use_data_augmentation', action='store_true',
+						help='Enable data augmentation for query graphs')
+	parser.add_argument('--aug_noise_std', type=float, default=0.05,
+						help='Standard deviation for feature noise augmentation')
+	parser.add_argument('--aug_edge_dropout', type=float, default=0.1,
+						help='Edge dropout rate for augmentation')
+	parser.add_argument('--aug_feature_mask', type=float, default=0.1,
+						help='Feature mask rate for augmentation')
+	parser.add_argument('--use_mixup', action='store_true',
+						help='Use Mixup data augmentation')
+	parser.add_argument('--mixup_alpha', type=float, default=0.2,
+						help='Alpha parameter for Mixup augmentation')
+	
 	# High error query logging settings
 	parser.add_argument('--log_high_error', action='store_true',
 						help='Enable logging of high error queries')

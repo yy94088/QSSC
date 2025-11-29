@@ -18,6 +18,12 @@ class DecomGNN(nn.Module):
         self.model_type = args.model_type
         self.dropout = args.dropout
         self.convs = nn.ModuleList()
+        
+        # 添加层归一化以稳定训练
+        self.layer_norms = nn.ModuleList()
+        
+        # 添加残差投影层（当维度不匹配时）
+        self.residual_projections = nn.ModuleList()
 
         cov_layer = self.build_cov_layer(self.model_type)
 
@@ -33,6 +39,15 @@ class DecomGNN(nn.Module):
                 self.convs.append(cov_layer(hidden_input_dim, hidden_output_dim, self.num_edge_feat))
             else:
                 raise ValueError("Unsupported model type: %s" % self.model_type)
+            
+            # 为每层添加LayerNorm
+            self.layer_norms.append(nn.LayerNorm(hidden_output_dim))
+            
+            # 如果输入输出维度不同，添加投影层用于残差连接
+            if hidden_input_dim != hidden_output_dim:
+                self.residual_projections.append(nn.Linear(hidden_input_dim, hidden_output_dim))
+            else:
+                self.residual_projections.append(None)
 
 
     def build_cov_layer(self, model_type):
@@ -72,7 +87,11 @@ class DecomGNN(nn.Module):
             return torch.zeros(1, self.num_out, device=x.device)
 
         for i in range(self.num_layers):
+            # 保存输入用于残差连接
+            identity = x
+            
             try:
+                # GNN卷积
                 if self.model_type in ("GIN", "GINE", "GAT", "GCN", "SAGE"):
                     x = self.convs[i](x, edge_index)
                 elif self.model_type in ("NN", "NNGIN", "NNGINConcat"):
@@ -84,10 +103,26 @@ class DecomGNN(nn.Module):
             except Exception:
                 return torch.zeros(1, self.num_out, device=x.device)
 
+            # 残差连接（跳过最后一层，因为可能需要特定的输出维度）
             if i < self.num_layers - 1:
+                # 如果维度不匹配，使用投影
+                if self.residual_projections[i] is not None:
+                    identity = self.residual_projections[i](identity)
+                
+                # 残差连接: x = x + identity
+                x = x + identity
+                
+                # 层归一化
+                x = self.layer_norms[i](x)
+                
+                # Dropout
                 x = F.dropout(x, p=self.dropout, training=self.training)
+                
                 if torch.isnan(x).any() or torch.isinf(x).any():
                     return torch.zeros(1, self.num_out, device=x.device)
+            else:
+                # 最后一层也应用LayerNorm
+                x = self.layer_norms[i](x)
 
         x = torch.unsqueeze(torch.sum(x, dim=0), dim=0)
         if torch.isnan(x).any() or torch.isinf(x).any():

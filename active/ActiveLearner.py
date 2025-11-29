@@ -7,7 +7,15 @@ from scipy.stats import  entropy, gmean
 import datetime
 import math
 import logging
-from cardnet.loss import ContrastiveLoss
+from cardnet.loss import ContrastiveLoss, QErrorLoss, AdaptiveWeightedMSELoss
+
+# 导入数据增强模块（如果存在）
+try:
+	from cardnet.data_augmentation import QueryGraphAugmentation, apply_augmentation_to_batch
+	DATA_AUG_AVAILABLE = True
+except ImportError:
+	DATA_AUG_AVAILABLE = False
+	print("Warning: Data augmentation module not available")
 
 # 向量化的概率分布计算函数（避免在训练循环中重复定义）
 def value_to_prob_distribution_vectorized(values, bins, sigma=1.0):
@@ -46,6 +54,40 @@ class ActiveLearner:
 		self.biased_sample = args.biased_sample
 		self.max_iterations = getattr(args, 'max_iterations', 5)
 		self.tolerance = getattr(args, 'tolerance', 1e-4)
+		
+		# 新增：损失函数类型
+		self.loss_type = getattr(args, 'loss_type', 'mse')
+		
+		# 新增：数据增强
+		self.use_data_augmentation = getattr(args, 'use_data_augmentation', False)
+		if self.use_data_augmentation and DATA_AUG_AVAILABLE:
+			self.augmentor = QueryGraphAugmentation(
+				feature_noise_std=getattr(args, 'aug_noise_std', 0.05),
+				edge_dropout_rate=getattr(args, 'aug_edge_dropout', 0.1),
+				feature_mask_rate=getattr(args, 'aug_feature_mask', 0.1)
+			)
+			print(f"✓ Data augmentation enabled: noise={self.augmentor.feature_noise_std}, "
+				  f"edge_drop={self.augmentor.edge_dropout_rate}")
+		else:
+			self.augmentor = None
+	
+	def _get_loss_function(self):
+		"""根据配置返回合适的损失函数"""
+		if self.loss_type == 'qerror':
+			print("Using Q-Error Loss (better for cardinality estimation)")
+			return QErrorLoss()
+		elif self.loss_type == 'weighted_mse':
+			print(f"Using Adaptive Weighted MSE Loss (weight_exp={self.args.weight_exp})")
+			return AdaptiveWeightedMSELoss(weight_exp=self.args.weight_exp)
+		elif self.loss_type == 'hybrid':
+			# 混合损失：MSE + Q-Error
+			print("Using Hybrid Loss (MSE + Q-Error)")
+			return lambda pred, target: (
+				torch.nn.functional.mse_loss(pred, target) + 
+				0.5 * QErrorLoss()(pred, target)
+			)
+		else:  # 默认MSE
+			return torch.nn.MSELoss()
 
 	def train(self, model, criterion, criterion_cal,
 			  train_datasets, val_datasets, optimizer, scheduler=None, active = False):
@@ -55,6 +97,9 @@ class ActiveLearner:
 
 		train_loaders = _to_dataloaders(datasets= train_datasets)
 		start = datetime.datetime.now()
+		
+		# 使用改进的损失函数
+		base_criterion = self._get_loss_function()
 		contrastive_criterion = ContrastiveLoss(cardinality_threshold=self.args.cardinality_threshold)
 
 		for loader_idx, dataloader in enumerate(train_loaders):
@@ -66,6 +111,14 @@ class ActiveLearner:
 				epoch_loss, epoch_loss_cla, epoch_loss_distill, epoch_loss_distill_kl, epoch_loss_con = 0.0, 0.0, 0.0, 0.0, 0.0
 				for i, (decomp_x, decomp_edge_index, decomp_edge_attr, card, label, soft_card) in \
 						enumerate(dataloader):
+					
+					# 数据增强（如果启用）
+					if self.augmentor is not None and model.training:
+						decomp_x, decomp_edge_index, decomp_edge_attr = apply_augmentation_to_batch(
+							decomp_x, decomp_edge_index, decomp_edge_attr, 
+							self.augmentor, training=True
+						)
+					
 					if self.args.cuda:
 						decomp_x, decomp_edge_index, decomp_edge_attr = \
 							_to_cuda(decomp_x), _to_cuda(decomp_edge_index), _to_cuda(decomp_edge_attr)
@@ -74,7 +127,19 @@ class ActiveLearner:
 					# 模型前向：直接使用提供的card进行预测（模型不再在内部使用memory）
 					output, output_cla, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr, card)
 					
-					# hid_g 为模型返回的隐藏表示，可用于对比学习或外部处理
+					# hid_g 为模型返回的隐藏表示（或embedding），可用于对比学习或memory更新
+					# 如果模型有memory，则在训练时用真实card更新memory
+					if model.memory_bank is not None and model.training:
+						# hid_g is the embedding returned by forward (shape [1, embedding_dim])
+						# Compute prediction error for quality tracking
+						with torch.no_grad():
+							prediction_error = torch.abs(output.detach() - card).item()
+							# Update memory with query embedding, true card, and prediction error
+							model.memory_bank.update_memory(
+								query_embedding=hid_g.detach(),
+								query_cardinality=card,
+								prediction_error=prediction_error
+							)
 					
 					# 保存原始输出用于KL散度计算
 					output_orig = output
@@ -98,7 +163,8 @@ class ActiveLearner:
 						optimizer.zero_grad()
 						continue
 
-					loss = criterion(output, card) * (1 - self.distill_alpha - self.distill_kl_alpha)
+					# 使用改进的损失函数
+					loss = base_criterion(output, card) * (1 - self.distill_alpha - self.distill_kl_alpha)
 					
 					# 检查损失是否为NaN
 					if torch.isnan(loss):
@@ -208,7 +274,11 @@ class ActiveLearner:
 				print("{}-th QuerySet, {}-th Epoch: Reg. Loss={:.4f}, Cla. Loss={:.4f}, Distill Loss={:.4f}, Distill KL Loss={:.4f}"
 					  .format(loader_idx, epoch, epoch_loss, epoch_loss_cla, epoch_loss_distill, epoch_loss_distill_kl))
 				
-				# memory statistics printing disabled (active-related features removed)
+				# Print memory statistics if memory bank is available
+				if (epoch + 1) % 5 == 0 and model.memory_bank is not None:
+					stats = model.memory_bank.get_statistics()
+					print(f"  Memory Stats: entries={stats['total_entries']}, avg_quality={stats['avg_quality']:.3f}, "
+						  f"success_rate={stats['retrieval_success_rate']:.3f}, threshold={stats['current_threshold']:.3f}")
 
 			# Evaluation the model
 			all_eval_res = self.evaluate(model, criterion, val_datasets, print_res = True)
