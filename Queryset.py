@@ -37,26 +37,15 @@ class Queryset(object):
 		embed_feat_path = os.path.join(args.embed_feat_dir, "{}.emb.npy".format(args.dataset))
 		embed_feat = np.load(embed_feat_path)
 
-		#assert embed_feat.shape[0] == len(self.node_label_card) + 1, "prone embedding size error!"
 		self.embed_dim = embed_feat.shape[1]
 		self.embed_feat = torch.from_numpy(embed_feat)
-		if self.args.embed_type == "freq":
-			self.num_node_feat = len(self.node_label_card)
-		elif self.args.embed_type == "n2v" or self.args.embed_type == "prone" or self.args.embed_type == "nrp":
-			self.num_node_feat = self.embed_dim
-		else:
-			self.num_node_feat = self.embed_dim + len(self.node_label_card)
+		self.num_node_feat = self.embed_dim
 
-		if self.args.edge_embed_type == "freq":
-			self.edge_embed_feat = None
-			self.edge_embed_dim = 0
-			self.num_edge_feat = len(self.edge_label_card)
-		else:
-			edge_embed_feat_path = os.path.join(args.embed_feat_dir, "{}_edge.emb.npy".format(args.dataset))
-			edge_embed_feat = np.load(edge_embed_feat_path)
-			self.edge_embed_dim = edge_embed_feat.shape[1]
-			self.edge_embed_feat = torch.from_numpy(edge_embed_feat)
-			self.num_edge_feat = self.edge_embed_dim
+		edge_embed_feat_path = os.path.join(args.embed_feat_dir, "{}_edge.emb.npy".format(args.dataset))
+		edge_embed_feat = np.load(edge_embed_feat_path)
+		self.edge_embed_dim = edge_embed_feat.shape[1]
+		self.edge_embed_feat = torch.from_numpy(edge_embed_feat)
+		self.num_edge_feat = self.edge_embed_dim
 
 
 		# transform the decomposed query to torch tensor
@@ -176,40 +165,12 @@ class Queryset(object):
 		decomp_edge_index = []
 		decomp_edge_attr = []
 		for graph in graphs:
-			if self.args.embed_type == "freq":
-				node_attr = self._get_nodes_attr_freq(graph)
-			elif self.args.embed_type == "n2v" or self.args.embed_type == "prone" or self.args.embed_type == "nrp":
-				node_attr = self._get_nodes_attr_embed(graph)
-			else:
-				node_attr_freq, node_attr_embed = self._get_nodes_attr_freq(graph), self._get_nodes_attr_embed(graph)
-				node_attr = torch.cat([node_attr_freq, node_attr_embed], dim=1)
-
-			if self.args.edge_embed_type == "freq":
-				edge_index, edge_attr = self._get_edges_index_freq(graph)
-			else:
-				edge_index, edge_attr = self._get_edges_index_embed(graph)
+			node_attr = self._get_nodes_attr_embed(graph)
+			edge_index, edge_attr = self._get_edges_index_embed(graph)
 			decomp_x.append(node_attr)
 			decomp_edge_index.append(edge_index)
 			decomp_edge_attr.append(edge_attr)
 		return decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card
-
-	def _get_nodes_attr(self, graph):
-		node_attr = torch.zeros(size=(graph.number_of_nodes(), self.num_node_feat), dtype= torch.float)
-		for v in graph.nodes():
-			if len(graph.nodes[v]["labels"]) == 0:
-				continue
-			for label in graph.nodes[v]["labels"]:
-				node_attr[v] += self.embed_feat[self.label_dict[label]]
-				self.node_label_fre += 1
-		return node_attr
-
-	def _get_nodes_attr_freq(self, graph):
-		node_attr = torch.ones(size=(graph.number_of_nodes(), len(self.node_label_card)), dtype=torch.float)
-		for v in graph.nodes():
-			for label in graph.nodes[v]["labels"]:
-				node_attr[v][self.label_dict[label]] = self.node_label_card[label]
-				self.node_label_fre += 1
-		return node_attr
 
 	def _get_nodes_attr_embed(self, graph):
 		node_attr = torch.zeros(size=(graph.number_of_nodes(), self.embed_dim), dtype=torch.float)
@@ -220,19 +181,6 @@ class Queryset(object):
 				node_attr[v] += self.embed_feat[self.label_dict[label]]
 				self.node_label_fre += 1
 		return node_attr
-
-
-	def _get_edges_index_freq(self, graph):
-		edge_index = torch.ones(size= (2, graph.number_of_edges()), dtype = torch.long)
-		edge_attr = torch.zeros(size= (graph.number_of_edges(), len(self.edge_label_card)), dtype=torch.float)
-		cnt = 0
-		for e in graph.edges():
-			edge_index[0][cnt], edge_index[1][cnt] = e[0], e[1]
-			for label in graph.edges[e]["labels"]:
-				edge_attr[cnt][label] = self.edge_label_card[label]
-				self.edge_label_fre += 1
-			cnt += 1
-		return edge_index, edge_attr
 
 	def _get_edges_index_embed(self, graph):
 		edge_index = torch.ones(size= (2, graph.number_of_edges()), dtype = torch.long)

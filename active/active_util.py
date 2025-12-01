@@ -128,7 +128,7 @@ def save_eval_res(args, sizes, all_eval_res, save_res_dir):
 	make_dir(save_res_dir)
 	save_res_dir = os.path.join(save_res_dir, args.dataset)
 	make_dir(save_res_dir)
-	save_res_path = os.path.join(save_res_dir, "{}_{}_{}_{}_{}_cv.csv".format(args.dataset, args.model_type, args.embed_type, args.epochs, sizes))
+	save_res_path = os.path.join(save_res_dir, "{}_{}_{}_{}_cv.csv".format(args.dataset, args.model_type, args.epochs, sizes))
 	header = ['method', 'size', 'error', 'true_card']
 	with open(save_res_path, 'w') as in_file:
 		writer = csv.writer(in_file, delimiter=',')

@@ -155,10 +155,6 @@ if __name__ == "__main__":
 						help="number of convolutional layers")
 	parser.add_argument("--model_type", default="NNGINETransformer", type=str,
 						help="GNN layer type") # GIN, GINE, GAT, NN, GCN, SAGE, NNGIN, NNGINConcat, NNGINETransformer
-	parser.add_argument("--embed_type", default="prone", type=str,
-						help="the node feature encoding type") # freq, n2v, prone, n2v_concat, prone_concat, nrp are tested
-	parser.add_argument("--edge_embed_type", default="prone", type=str,
-						help="the edge feature encoding type")
 	parser.add_argument("--num_g_hid", default=128, type=int,
 						help="hidden dim for transforming nodes for intermediate GNN layer")
 	parser.add_argument("--num_e_hid", default=32, type=int,
@@ -280,12 +276,7 @@ if __name__ == "__main__":
 	args.true_homo_dir = os.path.join(args.full_data_dir, "true_homo")
 	args.data_dir = os.path.join(args.full_data_dir, "dataset")
 	args.prone_feat_dir = os.path.join(args.full_data_dir, "prone")
-	args.n2v_feat_dir = os.path.join(args.full_data_dir, "n2v")
-	args.nrp_feat_dir = os.path.join(args.full_data_dir, "nrp")
-	args.embed_feat_dir = args.n2v_feat_dir if args.embed_type == "n2v" or args.embed_type == "n2v_concat" else \
-		args.prone_feat_dir
-	if args.embed_type == "nrp":
-		args.embed_feat_dir = args.nrp_feat_dir
+	args.embed_feat_dir = args.prone_feat_dir
 	args.queryset_dir = args.queryset_homo_dir if args.matching == "homo" else  args.queryset_iso_dir
 	args.true_card_dir = args.true_homo_dir if args.matching == "homo" else args.true_iso_dir
 
