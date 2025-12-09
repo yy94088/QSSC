@@ -188,6 +188,7 @@ QSSC/
    - 最后调整关系网络参数（hidden_dim）
 
 3. **计算资源**：
+   
    - 关系网络会增加约20-30%的训练时间
    - 如果GPU内存不足，可以减小relation_hidden_dim或batch_size
 

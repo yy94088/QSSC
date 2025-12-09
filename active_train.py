@@ -199,12 +199,6 @@ if __name__ == "__main__":
 	parser.add_argument('--mixup_alpha', type=float, default=0.2,
 						help='Alpha parameter for Mixup augmentation')
 	
-	# High error query logging settings
-	parser.add_argument('--log_high_error', action='store_true',
-						help='Enable logging of high error queries')
-	parser.add_argument('--high_error_threshold', type=float, default=1.0,
-						help='Threshold for defining high error queries (in log scale)')
-	
 	# ===== Knowledge Distillation Settings =====
 	parser.add_argument('--use_distillation', action='store_true',
 						help='Enable knowledge distillation with soft labels')
@@ -223,6 +217,10 @@ if __name__ == "__main__":
 						help='Type of relation network: attention (multi-head attention) or graph (GNN-based)')
 	parser.add_argument('--relation_hidden_dim', type=int, default=128,
 						help='Hidden dimension for subgraph relation network')
+	parser.add_argument('--relation_fusion_type', type=str, default='concat',
+						choices=['replace', 'concat', 'gated'],
+						help='How to combine original and enhanced embeddings: '
+						     'replace (only enhanced), concat (concatenate both), gated (learnable fusion)')
 	
 	# Training settings
 	parser.add_argument("--cumulative", default=False, type=bool,

@@ -29,6 +29,8 @@ class CardNet(nn.Module):
 
         # Subgraph Relation Network (optional)
         self.use_subgraph_relation = getattr(args, 'use_subgraph_relation', False)
+        self.relation_fusion_type = getattr(args, 'relation_fusion_type', 'replace')  # 'replace', 'concat', 'gated'
+        
         if self.use_subgraph_relation:
             relation_hidden_dim = getattr(args, 'relation_hidden_dim', 128)
             relation_type = getattr(args, 'relation_type', 'attention')  # 'attention' or 'graph'
@@ -47,7 +49,21 @@ class CardNet(nn.Module):
                     num_layers=2,
                     dropout=0.1
                 )
-            print(f"Subgraph Relation Network enabled: type={relation_type}, hidden_dim={relation_hidden_dim}")
+            
+            # Fusion mechanism for combining original and enhanced embeddings
+            if self.relation_fusion_type == 'concat':
+                # Concatenate original and enhanced embeddings
+                predictor_in_ch = self.encoder.mlp_in_ch * 2
+                print(f"Subgraph Relation enabled: type={relation_type}, fusion=concat, predictor_in={predictor_in_ch}")
+            elif self.relation_fusion_type == 'gated':
+                # Gated fusion with learnable gate
+                self.fusion_gate = nn.Sequential(
+                    nn.Linear(self.encoder.mlp_in_ch * 2, self.encoder.mlp_in_ch),
+                    nn.Sigmoid()
+                )
+                print(f"Subgraph Relation enabled: type={relation_type}, fusion=gated (learnable)")
+            else:  # 'replace'
+                print(f"Subgraph Relation enabled: type={relation_type}, fusion=replace")
         else:
             self.relation_net = None
 
@@ -81,7 +97,7 @@ class CardNet(nn.Module):
         # Encode graph structure with optional subgraph embeddings
         if self.use_subgraph_relation:
             # Get individual subgraph embeddings before pooling
-            x, subgraph_embeds = self.encoder(decomp_x, decomp_edge_index, decomp_edge_attr, 
+            x_original, subgraph_embeds = self.encoder(decomp_x, decomp_edge_index, decomp_edge_attr, 
                                               return_subgraph_embeds=True)
             
             # Apply relation network to enhance subgraph embeddings
@@ -91,17 +107,33 @@ class CardNet(nn.Module):
                 else:  # GraphBasedRelationNet
                     enhanced_embeds = self.relation_net(subgraph_embeds)
                 
-                # Re-pool the enhanced embeddings
+                # Pool the enhanced embeddings
                 if self.pool_type == "sum":
-                    x = torch.sum(enhanced_embeds, dim=0).unsqueeze(dim=0)
+                    x_enhanced = torch.sum(enhanced_embeds, dim=0).unsqueeze(dim=0)
                 elif self.pool_type == "mean":
-                    x = torch.mean(enhanced_embeds, dim=0).unsqueeze(dim=0)
+                    x_enhanced = torch.mean(enhanced_embeds, dim=0).unsqueeze(dim=0)
                 elif self.pool_type == "max":
-                    x, _ = torch.max(enhanced_embeds, dim=0, keepdim=True)
+                    x_enhanced, _ = torch.max(enhanced_embeds, dim=0, keepdim=True)
                 else:  # attention pooling
                     att_weights = self.encoder.att_layer(enhanced_embeds)
                     enhanced_embeds_pooled = att_weights.matmul(enhanced_embeds)
-                    x = enhanced_embeds_pooled.view((1, self.num_expert * self.out_g_ch))
+                    x_enhanced = enhanced_embeds_pooled.view((1, self.num_expert * self.out_g_ch))
+                
+                # Fusion strategy: combine original and enhanced embeddings
+                if self.relation_fusion_type == 'concat':
+                    # Concatenate original and enhanced representations
+                    x = torch.cat([x_original, x_enhanced], dim=-1)
+                elif self.relation_fusion_type == 'gated':
+                    # Gated fusion: learnable combination
+                    combined = torch.cat([x_original, x_enhanced], dim=-1)
+                    gate = self.fusion_gate(combined)
+                    x = gate * x_enhanced + (1 - gate) * x_original
+                else:  # 'replace'
+                    # Use only enhanced embeddings (original behavior)
+                    x = x_enhanced
+            else:
+                # Single subgraph or None: use original
+                x = x_original
         else:
             # Standard encoding without relation network
             x = self.encoder(decomp_x, decomp_edge_index, decomp_edge_attr)
