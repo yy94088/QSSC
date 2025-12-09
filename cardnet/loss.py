@@ -73,6 +73,67 @@ class AdaptiveWeightedMSELoss(nn.Module):
         return weighted_mse
 
 
+class DistillationLoss(nn.Module):
+    """
+    Knowledge Distillation Loss with confidence-based soft label quality handling.
+    
+    Dynamically adjusts distillation weight based on the quality of soft labels
+    by comparing them with true labels. High-quality soft labels get more weight.
+    """
+    def __init__(self, alpha=0.5, temperature=2.0, confidence_threshold=1.0):
+        """
+        Args:
+            alpha (float): Balance between hard loss and soft loss (0~1)
+                          0 = only hard labels, 1 = only soft labels
+            temperature (float): Temperature for softening the predictions
+            confidence_threshold (float): Threshold for soft label quality (in log space)
+                                         Soft labels with error > threshold get reduced weight
+        """
+        super(DistillationLoss, self).__init__()
+        self.alpha = alpha
+        self.temperature = temperature
+        self.confidence_threshold = confidence_threshold
+        self.epsilon = 1e-8
+    
+    def forward(self, student_pred, soft_label, hard_label):
+        """
+        Args:
+            student_pred (Tensor): Student model predictions (log cardinality)
+            soft_label (Tensor): Teacher model predictions (log cardinality)
+            hard_label (Tensor): True cardinality (log cardinality)
+        
+        Returns:
+            loss (Tensor): Combined distillation loss
+            quality_weights (Tensor): Computed confidence weights for monitoring
+        """
+        # Compute hard loss (student vs true label)
+        hard_loss = F.mse_loss(student_pred, hard_label)
+        
+        # Check if soft labels are available
+        if soft_label is None or torch.isnan(soft_label).any():
+            return hard_loss, torch.ones_like(hard_label)
+        
+        # Compute soft label quality by comparing with hard labels
+        # Quality decreases as the difference increases
+        soft_label_error = torch.abs(soft_label - hard_label)
+        
+        # Compute confidence weights: higher weight for better soft labels
+        # Use sigmoid to map error to [0, 1], inverted so small error = high weight
+        quality_weights = torch.sigmoid((self.confidence_threshold - soft_label_error) / self.temperature)
+        
+        # Compute soft loss (student vs teacher) with temperature scaling
+        # Temperature makes the distribution softer for knowledge transfer
+        soft_loss = F.mse_loss(student_pred / self.temperature, soft_label / self.temperature)
+        
+        # Combine losses with adaptive weighting based on soft label quality
+        # Good soft labels: use more distillation
+        # Bad soft labels: rely more on hard labels
+        adaptive_alpha = self.alpha * quality_weights.mean()
+        total_loss = (1 - adaptive_alpha) * hard_loss + adaptive_alpha * soft_loss * (self.temperature ** 2)
+        
+        return total_loss, quality_weights
+
+
 class ContrastiveLoss(nn.Module):
     """
     基于基数的对比学习损失。

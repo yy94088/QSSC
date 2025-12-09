@@ -89,13 +89,14 @@ def print_eval_res(all_eval_res, print_details= True):
 	for i, (res, loss, l1, elapse_time) in enumerate(all_eval_res):
 		print("Evaluation result of {}-th Eval set: Loss= {:.4f}, Avg. L1 Loss= {:.4f}, Avg. Pred. Time= {:.9f}(s)"
 			  .format(i, loss, l1/len(res), elapse_time/len(res)))
-		errors = [ abs(output - card) for card, output, soft_card in res]
-		teacher_errors = [ abs(soft_card - card) for card, output, soft_card in res if not (np.isnan(soft_card) or np.isinf(soft_card))]  # 过滤NaN和无穷大值
-		get_prediction_statistics(errors, "Student Model Result Profile")
+		# Q-error without absolute value: positive = overestimate, negative = underestimate
+		errors = [ output - card for card, output, soft_card in res]
+		teacher_errors = [ soft_card - card for card, output, soft_card in res if not (np.isnan(soft_card) or np.isinf(soft_card))]  # 过滤NaN和无穷大值
+		get_prediction_statistics(errors, "Student Model Q-Error (pred-true, +overest/-underest)")
 		
 		# 添加教师模型的统计信息
 		if teacher_errors:
-			get_prediction_statistics(teacher_errors, "Teacher Model (soft_card) Result Profile")
+			get_prediction_statistics(teacher_errors, "Teacher Model Q-Error (pred-true, +overest/-underest)")
 		
 		all_errors += errors
 		if teacher_errors:
@@ -104,31 +105,31 @@ def print_eval_res(all_eval_res, print_details= True):
 		total_l1 += l1
 		if print_details:
 			print("Detailed Prediction Results:")
-			print("{:<10} {:<15} {:<15} {:<20} {:<12} {:<12} {:<18}".format(
-				"Sample ID", "true(log)", "pred(log)", "teacher_pred(log)", "MSE Loss", "L1 Error", "Teacher L1 Error"))
-			print("-" * 110)
+			print("{:<10} {:<15} {:<15} {:<20} {:<12} {:<15} {:<20}".format(
+				"Sample ID", "true(log)", "pred(log)", "teacher_pred(log)", "MSE Loss", "Q-Error(p-t)", "Teacher Q-Error(p-t)"))
+			print("-" * 120)
 			for idx, (card, output, soft_card) in enumerate(res):
 				mse_loss = (card - output) ** 2
-				l1_error = card - output
-				teacher_l1_error = card - soft_card if not (np.isnan(soft_card) or np.isinf(soft_card)) else float('nan')
-				print("{:<10} {:<15.4f} {:<15.4f} {:<20.4f} {:<12.4f} {:<12.4f} {:<18.4f}".format(
-					idx, card, output, soft_card, mse_loss, l1_error, teacher_l1_error))
+				q_error = output - card  # Positive = overestimate, Negative = underestimate
+				teacher_q_error = soft_card - card if not (np.isnan(soft_card) or np.isinf(soft_card)) else float('nan')
+				print("{:<10} {:<15.4f} {:<15.4f} {:<20.4f} {:<12.4f} {:<15.4f} {:<20.4f}".format(
+					idx, card, output, soft_card, mse_loss, q_error, teacher_q_error))
 	print("Evaluation result of Eval dataset: Total Loss= {:.4f}, Total L1 Loss= {:.4f}".format(total_loss, total_l1))
-	get_prediction_statistics(all_errors, "Overall Student Model Result Profile")
+	get_prediction_statistics(all_errors, "Overall Student Q-Error (pred-true, +overest/-underest)")
 	
 	# 添加教师模型的整体统计信息
 	if all_teacher_errors:
-		get_prediction_statistics(all_teacher_errors, "Overall Teacher Model Result Profile")
+		get_prediction_statistics(all_teacher_errors, "Overall Teacher Q-Error (pred-true, +overest/-underest)")
 	
-	# 计算并返回中位数误差
-	error_median = np.median(all_errors) if all_errors else 0
+	# 计算并返回中位数误差（使用绝对值计算，用于比较）
+	error_median = np.median([abs(e) for e in all_errors]) if all_errors else 0
 	return error_median
 
 def save_eval_res(args, sizes, all_eval_res, save_res_dir):
 	make_dir(save_res_dir)
 	save_res_dir = os.path.join(save_res_dir, args.dataset)
 	make_dir(save_res_dir)
-	save_res_path = os.path.join(save_res_dir, "{}_{}_{}_{}_{}_cv.csv".format(args.dataset, args.model_type, args.embed_type, args.epochs, sizes))
+	save_res_path = os.path.join(save_res_dir, "{}_{}_{}_{}_cv.csv".format(args.dataset, args.model_type, args.epochs, sizes))
 	header = ['method', 'size', 'error', 'true_card']
 	with open(save_res_path, 'w') as in_file:
 		writer = csv.writer(in_file, delimiter=',')

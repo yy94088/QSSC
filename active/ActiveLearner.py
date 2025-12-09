@@ -3,7 +3,7 @@ import numpy as np
 import random
 from .active_util import _to_cuda, _to_dataloaders, _to_datasets, print_eval_res
 import datetime
-from cardnet.loss import QErrorLoss, AdaptiveWeightedMSELoss
+from cardnet.loss import QErrorLoss, AdaptiveWeightedMSELoss, DistillationLoss
 
 
 class ActiveLearner:
@@ -15,6 +15,17 @@ class ActiveLearner:
 		
 		# Loss function type
 		self.loss_type = getattr(args, 'loss_type', 'mse')
+		
+		# Distillation parameters
+		self.use_distillation = getattr(args, 'use_distillation', False)
+		if self.use_distillation:
+			self.distillation_loss = DistillationLoss(
+				alpha=getattr(args, 'distillation_alpha', 0.5),
+				temperature=getattr(args, 'distillation_temperature', 2.0),
+				confidence_threshold=getattr(args, 'confidence_threshold', 1.0)
+			)
+			print(f"Knowledge Distillation Enabled: alpha={args.distillation_alpha}, "
+				  f"T={args.distillation_temperature}, threshold={args.confidence_threshold}")
 	
 	def _get_loss_function(self):
 		"""Get appropriate loss function based on configuration."""
@@ -79,8 +90,19 @@ class ActiveLearner:
 						if output.numel() > 1:
 							output = output.mean()
 
-					# Compute loss
-					loss = base_criterion(output, card)
+					# Compute loss with optional distillation
+					if self.use_distillation and soft_card is not None:
+						# Use distillation loss
+						loss, quality_weights = self.distillation_loss(output, soft_card, card)
+						
+						# Log quality weights occasionally for monitoring
+						if i % 100 == 0:
+							avg_quality = quality_weights.mean().item()
+							print(f"    Batch {i}: Soft label quality weight = {avg_quality:.4f}")
+					else:
+						# Use standard loss
+						loss = base_criterion(output, card)
+					
 					epoch_loss += loss.item()
 					loss = loss / self.args.batch_size
 
@@ -154,6 +176,7 @@ class ActiveLearner:
 					true_val = card.item()
 					pred_val = output.item()
 					soft_val = soft_card.item() if soft_card is not None else float('nan')
+					# L1 still uses absolute value for loss computation
 					l1_error = abs(true_val - pred_val)
 					l1 += l1_error
 					res.append((true_val, pred_val, soft_val))
@@ -164,6 +187,7 @@ class ActiveLearner:
 						true_val = card[j].item() if card.dim() > 0 else card.item()
 						pred_val = output[j].item() if output.dim() > 0 else output.item()
 						soft_val = soft_card[j].item() if (soft_card is not None and soft_card.dim() > 0) else float('nan')
+						# L1 still uses absolute value for loss computation
 						l1_error = abs(true_val - pred_val)
 						l1 += l1_error
 						res.append((true_val, pred_val, soft_val))

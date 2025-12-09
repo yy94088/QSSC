@@ -204,6 +204,26 @@ if __name__ == "__main__":
 						help='Enable logging of high error queries')
 	parser.add_argument('--high_error_threshold', type=float, default=1.0,
 						help='Threshold for defining high error queries (in log scale)')
+	
+	# ===== Knowledge Distillation Settings =====
+	parser.add_argument('--use_distillation', action='store_true',
+						help='Enable knowledge distillation with soft labels')
+	parser.add_argument('--distillation_alpha', type=float, default=0.5,
+						help='Balance between hard loss and soft loss (0~1). 0=only hard, 1=only soft')
+	parser.add_argument('--distillation_temperature', type=float, default=2.0,
+						help='Temperature for softening predictions in distillation')
+	parser.add_argument('--confidence_threshold', type=float, default=1.0,
+						help='Quality threshold for soft labels (in log space)')
+	
+	# ===== Subgraph Relation Network Settings =====
+	parser.add_argument('--use_subgraph_relation', action='store_true',
+						help='Enable subgraph relation network to model interactions between decomposed subgraphs')
+	parser.add_argument('--relation_type', type=str, default='attention',
+						choices=['attention', 'graph'],
+						help='Type of relation network: attention (multi-head attention) or graph (GNN-based)')
+	parser.add_argument('--relation_hidden_dim', type=int, default=128,
+						help='Hidden dimension for subgraph relation network')
+	
 	# Training settings
 	parser.add_argument("--cumulative", default=False, type=bool,
 						help='Whether or not to enable cumulative learning')
@@ -226,9 +246,6 @@ if __name__ == "__main__":
 	parser.add_argument('--num_workers', type=int, default=8,
 						help='Number of worker processes for parallel processing and Dataset workers')
 	
-	# ===== Simplified: Removed classification and active learning parameters =====
-	# Classification task has been removed to simplify the model
-	# Active learning has been removed to focus on core cardinality estimation
 	
 	parser.add_argument("--size", type=int, default=8,
 						help="Query graph size")

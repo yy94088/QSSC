@@ -179,7 +179,7 @@ class CardEncoder(nn.Module):
         self.att_layer = Attention(self.num_expert, args.num_att_hid, self.out_g_ch)
         self.mlp_in_ch = self.num_expert * self.out_g_ch if self.pool_type == "att" else self.out_g_ch
 
-    def forward(self, decomp_x, decomp_edge_index, decomp_edge_attr):
+    def forward(self, decomp_x, decomp_edge_index, decomp_edge_attr, return_subgraph_embeds=False):
         g = None
         for x, edge_index, edge_attr in zip(decomp_x, decomp_edge_index, decomp_edge_attr):
             x, edge_index, edge_attr = x.squeeze(), edge_index.squeeze(), edge_attr.squeeze()
@@ -197,7 +197,11 @@ class CardEncoder(nn.Module):
 
         if g is None or torch.isnan(g).any() or torch.isinf(g).any():
             x = torch.zeros(1, self.mlp_in_ch, device=next(self.parameters()).device)
+            subgraph_embeds = None
         else:
+            # Store subgraph embeddings before pooling
+            subgraph_embeds = g if return_subgraph_embeds else None
+            
             if self.pool_type == "sum":
                 x = torch.sum(g, dim=0).unsqueeze(dim=0)
             elif self.pool_type == "mean":
@@ -212,4 +216,6 @@ class CardEncoder(nn.Module):
         if torch.isnan(x).any() or torch.isinf(x).any():
             x = torch.zeros_like(x)
 
+        if return_subgraph_embeds:
+            return x, subgraph_embeds
         return x
