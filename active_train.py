@@ -20,7 +20,6 @@ def main(args):
 	true_card_dir = args.true_card_dir
 	dataset = args.dataset
 	data_dir = args.data_dir
-	pattern = args.pattern
 
 	# optimizer parameter
 	lr = args.learning_rate
@@ -29,7 +28,7 @@ def main(args):
 
 
 
-	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern=pattern, k=args.k, size=args.size)
+	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern='query', k=args.k, size=args.size)
 	# decompose the query
 	if args.use_parallel:
 		print(f"Using parallel processing for query decomposition with {args.num_workers} workers...")
@@ -49,8 +48,12 @@ def main(args):
 	train_datasets = _to_datasets(train_sets) if args.cumulative else _to_datasets(all_train_sets)
 	val_datasets, test_datasets = _to_datasets(val_sets), _to_datasets(test_sets)
 
-	# Create model (simplified - no memory bank, no classification)
-	model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
+	# Create model
+	model = cardnet.CardNet(
+		args, 
+		num_node_feat=num_node_feat, 
+		num_edge_feat=num_edge_feat
+	)
 	print(model)
 	
 	# Only regression loss
@@ -85,13 +88,12 @@ def cross_validate(args):
 	queryset_dir = args.queryset_dir
 	true_card_dir = args.true_card_dir
 	dataset = args.dataset
-	pattern = args.pattern
 	
 	lr = args.learning_rate
 	weight_decay = args.weight_decay
 	decay_factor = args.decay_factor
 
-	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern=pattern, k=args.k, size=args.size)
+	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern='query', k=args.k, size=args.size)
 	if args.use_parallel:
 		print(f"Using parallel processing for query decomposition with {args.num_workers} workers...")
 		QD.decompose_queries_parallel(num_workers=args.num_workers)
@@ -117,7 +119,11 @@ def cross_validate(args):
 		print("start the {}/{} fold training ...".format(i, args.num_fold))
 		train_datasets, val_datasets = _to_datasets([train_sets]), _to_datasets(val_sets)
 		
-		model = cardnet.CardNet(args, num_node_feat=num_node_feat, num_edge_feat=num_edge_feat)
+		model = cardnet.CardNet(
+			args, 
+			num_node_feat=num_node_feat, 
+			num_edge_feat=num_edge_feat
+		)
 		print(model)
 		optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 		scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_factor)
@@ -171,10 +177,6 @@ if __name__ == "__main__":
 						help='shards pooling layer type')
 	parser.add_argument('--dropout', type=float, default=0.2,
 						help='Dropout rate (1 - keep probability).')
-	parser.add_argument('--memory_size', type=int, default=0,
-						help='Size of the query memory bank. 0 means disabled (DEPRECATED, use new methods instead).')
-	parser.add_argument('--similarity_threshold', type=float, default=0.7,
-						help='Similarity threshold for memory retrieval and update.')
 	
 	# ===== 新增：改进的损失函数和训练策略 =====
 	parser.add_argument('--loss_type', type=str, default='mse',
@@ -208,7 +210,8 @@ if __name__ == "__main__":
 	parser.add_argument("--num_fold", default=5, type=int,
 						help="number of fold for cross validation")
 	parser.add_argument("--epochs", default=30, type=int)
-	parser.add_argument("--batch_size", default= 10, type=int)
+	parser.add_argument("--batch_size", default=16, type=int,
+						help="Batch size for training (increased from 1 to 16 for better efficiency)")
 	parser.add_argument("--learning_rate", default= 1e-4, type=float)
 	parser.add_argument('--weight_decay', type=float, default=5e-4,
 						help='Weight decay (L2 loss on parameters).')
@@ -227,26 +230,9 @@ if __name__ == "__main__":
 	# Classification task has been removed to simplify the model
 	# Active learning has been removed to focus on core cardinality estimation
 	
-	# Knowledge distillation settings (optional)
-	parser.add_argument("--distill_alpha", type=float, default=0.0,
-						help="Coefficient for knowledge distillation (0 to disable)")
-	parser.add_argument("--pattern", type=str, default='query',
-						help="Specific pattern_size to load (e.g., query_4 query_8)")
 	parser.add_argument("--size", type=int, default=8,
 						help="Query graph size")
 	
-	# Contrastive Learning settings (optional - usually not needed) (optional)
-	parser.add_argument('--contrastive_weight', type=float, default=0.01,
-						help='Weight for the contrastive loss.')
-	parser.add_argument('--cardinality_threshold', type=float, default=1.5,
-						help='Cardinality threshold for defining positive pairs in contrastive loss (log scale).')
-	# Similarity Search and Refinement settings
-	parser.add_argument('--use_refinement', action='store_true', default=True,
-						help='Enable the refinement network.')
-	parser.add_argument('--similarity_k', type=int, default=3,
-						help='Number of nearest neighbors to use for refinement.')
-	parser.add_argument('--similarity_threshold', type=float, default=0.9,
-						help='Cosine similarity threshold for finding similar queries.')
 	# Input and Output directory
 	parser.add_argument("--dataset", type=str, default="dblp")  # aids, wordnet, yeast, hprd, youtube, eu2005 are tested
 	parser.add_argument("--full_data_dir", type=str, default="./data/")
@@ -255,8 +241,6 @@ if __name__ == "__main__":
 	parser.add_argument("--model_save_dir", type=str, default="./models")
 
 	# Other parameters
-	parser.add_argument("--matching", default="iso", type=str,
-						help="The subgraph matching mode")
 	parser.add_argument('--k', type=int, default=3,
 						help='decompose hop number.')
 	parser.add_argument("--verbose", default=True, type=bool)
@@ -270,15 +254,11 @@ if __name__ == "__main__":
 	args.cuda = not args.no_cuda and torch.cuda.is_available()
 	args.device = torch.device('cuda' if args.cuda else 'cpu')
 	# set the input dir
-	args.queryset_iso_dir = os.path.join(args.full_data_dir, "queryset")
-	args.queryset_homo_dir = os.path.join(args.full_data_dir, "queryset_homo")
-	args.true_iso_dir = os.path.join(args.full_data_dir, "true_cardinality")
-	args.true_homo_dir = os.path.join(args.full_data_dir, "true_homo")
+	args.queryset_dir = os.path.join(args.full_data_dir, "queryset")
+	args.true_card_dir = os.path.join(args.full_data_dir, "true_cardinality")
 	args.data_dir = os.path.join(args.full_data_dir, "dataset")
 	args.prone_feat_dir = os.path.join(args.full_data_dir, "prone")
 	args.embed_feat_dir = args.prone_feat_dir
-	args.queryset_dir = args.queryset_homo_dir if args.matching == "homo" else  args.queryset_iso_dir
-	args.true_card_dir = args.true_homo_dir if args.matching == "homo" else args.true_iso_dir
 
 
 

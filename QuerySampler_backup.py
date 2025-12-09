@@ -1,14 +1,20 @@
 import os
 import numpy as np
 import networkx as nx
+import random
 import queue
+import pickle
+from util import make_dir, save_true_card
+import tqdm
 from multiprocessing import Pool, cpu_count
+import functools
+import logging
 import torch
 import json
 import time
+import subprocess
 import psutil
 from tqdm import tqdm
-
 
 def process_single_query_parallel(args_tuple):
     """
@@ -43,6 +49,9 @@ def process_single_query_parallel(args_tuple):
         
         true_card = true_card + 1 if true_card == 0 else true_card
         
+        # 序列化图
+        graph_key = temp_qd.serialize_graph(query)
+        
         return {
             'idx': idx,
             'query': query,
@@ -50,14 +59,14 @@ def process_single_query_parallel(args_tuple):
             'true_card': true_card,
             'soft_card': soft_card,
             'label_den': label_den,
+            'graph_key': graph_key,
             'query_id': (pattern, size, idx),
-            'file_name': os.path.basename(query_load_path)
+            'file_name': os.path.basename(query_load_path)  # <-- added filename
         }
         
     except Exception as e:
         print(f"Error processing query {query_load_path}: {str(e)}")
         return None
-
 
 class QueryDecompose(object):
 	def __init__(self, queryset_dir: str, true_card_dir: str, dataset: str, pattern: str = 'query', k = 3, size = 4):
@@ -97,6 +106,9 @@ class QueryDecompose(object):
 		
 		print(f"Starting parallel query decomposition with {num_workers} workers...")
 		start_time = time.time()
+		
+		# 显示系统信息
+		
 		
 		cpu_count_actual = cpu_count()
 		memory_gb = psutil.virtual_memory().total / (1024**3)
@@ -157,6 +169,7 @@ class QueryDecompose(object):
 			true_card = result['true_card']
 			soft_card = result['soft_card']
 			label_den = result['label_den']
+			graph_key = result['graph_key']
 			query_id = result['query_id']
 			file_name = result.get('file_name', f"{query_id[0]}_{query_id[1]}_{idx}")
 			
@@ -184,6 +197,7 @@ class QueryDecompose(object):
 
 	def decompose_queries(self):
 		avg_label_den = 0.0
+		distinct_card = {}
 		queries_dir = os.path.join(self.queryset_load_path, self.pattern+'_'+str(self.size))
 		self.all_subsets[(self.pattern, self.size)] = []
 		self.all_queries[(self.pattern, self.size)] = []
@@ -208,7 +222,10 @@ class QueryDecompose(object):
 			self.query_indices[(self.pattern, self.size, idx)] = query
 			self.query_file_names[(self.pattern, self.size, idx)] = query_dir
 			self.num_queries += 1
-		
+			# save the decomposed query
+			#query_save_path = os.path.splitext(query_load_path)[0] + ".pickle"
+			#self.save_decomposed_query(graphs, true_card, query_save_path)
+			#print("save decomposed query: {}".format(query_save_path))
 		print("num_queries", self.num_queries)
 		
 		if self.num_queries > 0:
@@ -277,6 +294,7 @@ class QueryDecompose(object):
 				id = int(tokens[1])
 				tmp_labels = [int(tokens[2])] # (only one label in the query node)
 				label = int(tmp_labels[0])
+				#tmp_labels = [int(token) for token in tokens[2 : ]]
 				labels = [] if -1 in tmp_labels else tmp_labels
 				label_cnt += len(labels)
 				nodes_list.append((id, {"labels": labels}))
@@ -287,11 +305,14 @@ class QueryDecompose(object):
 				tokens = line.strip().split()
 				src, dst = int(tokens[1]), int(tokens[2])
 				key = (node_label_dict[src], node_label_dict[dst])
+				# print("key:",key)
 				if str(key) in self.edge_index_map:
 					edge_label = self.edge_index_map[str(key)]
 				else:
 					edge_label = [int(tokens[3])]
 				tmp_labels = edge_label
+				# tmp_labels = [int(tokens[3])]
+				#tmp_labels = [int(token) for token in tokens[3 : ]]
 				labels = [] if -1 in tmp_labels else tmp_labels
 				edges_list.append((src, dst, {"labels": labels}))
 
@@ -308,4 +329,65 @@ class QueryDecompose(object):
 			true_card = float(in_file.readline().strip())
 			soft_card = float(in_file.readline().strip())
 			in_file.close()
-		return true_card, soft_card
+			return true_card, soft_card
+
+
+def get_true_cardinality(card_estimator_path, query_load_path, graph_load_path, timeout_sec = 7200):
+	
+	est_path = os.path.join(card_estimator_path, "SubgraphMatching.out")
+	cmd = "timeout %d %s -d %s -q %s -filter GQL -order GQL -engine LFTJ -num MAX"\
+		  %(timeout_sec, est_path, graph_load_path, query_load_path)
+	print(cmd)
+	popen = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
+	popen.wait()
+	card, run_time = None, None
+	for line in iter(popen.stdout.readline, b''):
+		line = line.decode("utf-8")
+		# if line.startswith("#Embeddings:"):
+		# 	card = line.partition("#Embeddings:")[-1].strip()
+		if line.startswith("Call Count:"):
+			card = line.partition("Call Count:")[-1].strip()
+		elif line.startswith("Enumerate time (seconds):"):
+			run_time = line.partition("Enumerate time (seconds):")[-1].strip()
+	return card, run_time
+
+
+def get_batch_true_card(card_estimator_path, queries_load_path, graph_load_path, card_save_dir):
+	queries_dir = os.listdir(queries_load_path)
+	for query_dir in queries_dir:
+		query_load_path = os.path.join(queries_load_path, query_dir)
+		# Parse pattern and size from filename
+		pattern, size = str(query_dir.split("_")[1]), str(query_dir.split("_")[2])
+
+		card, run_time = get_true_cardinality(card_estimator_path, query_load_path, graph_load_path)
+		if card is not None:
+			card_save_path = os.path.join(card_save_dir, '_'.join([pattern, size]))
+			make_dir(card_save_path)
+			card_save_path = os.path.join(card_save_path, os.path.splitext(query_dir)[0] + '.txt')
+			save_true_card(card, card_save_path, run_time)
+			print("save card {} in {}".format(card, card_save_path))
+
+
+def get_save_true_card(card_estimator_path, queries_load_path, graph_load_path, card_save_dir, query_dir):
+	query_load_path = os.path.join(queries_load_path, query_dir)
+	# Parse pattern and size from filename
+	pattern, size = str(query_dir.split("_")[1]), str(query_dir.split("_")[2])
+
+	card, run_time = get_true_cardinality(card_estimator_path, query_load_path, graph_load_path)
+	if card is not None:
+		card_save_path = os.path.join(card_save_dir, '_'.join([pattern, size]))
+		make_dir(card_save_path)
+		card_save_path = os.path.join(card_save_path, os.path.splitext(query_dir)[0] + '.txt')
+		save_true_card(card, card_save_path, run_time)
+		print("save card {} in {}".format(card, card_save_path))
+
+
+def process_batch_true_card(card_estimator_path, queries_load_path, graph_load_path, card_save_dir, num_workers = 10):
+	"""
+	parallel version of get_batch_true_card
+	"""
+	pro = functools.partial(get_save_true_card, card_estimator_path,
+											 graph_load_path, card_save_dir)
+	queries_dir = os.listdir(queries_load_path)
+	p = Pool(num_workers)
+	p.map(pro, queries_dir)
