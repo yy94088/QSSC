@@ -217,10 +217,6 @@ if __name__ == "__main__":
 						help='Type of relation network: attention (multi-head attention) or graph (GNN-based)')
 	parser.add_argument('--relation_hidden_dim', type=int, default=128,
 						help='Hidden dimension for subgraph relation network')
-	parser.add_argument('--relation_fusion_type', type=str, default='concat',
-						choices=['replace', 'concat', 'gated'],
-						help='How to combine original and enhanced embeddings: '
-						     'replace (only enhanced), concat (concatenate both), gated (learnable fusion)')
 	
 	# Training settings
 	parser.add_argument("--cumulative", default=False, type=bool,
