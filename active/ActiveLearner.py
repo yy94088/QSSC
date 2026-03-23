@@ -187,6 +187,9 @@ class ActiveLearner:
 				print(f"  {loader_idx}-th QuerySet, {epoch}-th Epoch: Loss={epoch_loss:.4f}")
 
 			# Evaluate after each loader
+			# Clear cache before evaluation to ensure we test the current model state
+			if self.cache_enabled:
+				self.clear_cache()
 			all_eval_res = self.evaluate(model, criterion, val_datasets, print_res=True)
 		
 		end = datetime.datetime.now()
@@ -216,17 +219,38 @@ class ActiveLearner:
 				else:
 					decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card = batch_data[:5]
 
+				# Check cache
+				cache_hit = False
+				if self.cache_enabled:
+					query_hash = self._get_query_hash(decomp_x, decomp_edge_index, decomp_edge_attr)
+					if query_hash is not None and query_hash in self.query_cache:
+						output = self.query_cache[query_hash]
+						cache_hit = True
+						self.cache_hits += 1
+					else:
+						self.cache_misses += 1
+
 				if self.args.cuda:
-					decomp_x = _to_cuda(decomp_x)
-					decomp_edge_index = _to_cuda(decomp_edge_index)
-					decomp_edge_attr = _to_cuda(decomp_edge_attr)
 					card = card.cuda()
 					if soft_card is not None:
 						soft_card = soft_card.cuda()
+					
+					if not cache_hit:
+						decomp_x = _to_cuda(decomp_x)
+						decomp_edge_index = _to_cuda(decomp_edge_index)
+						decomp_edge_attr = _to_cuda(decomp_edge_attr)
+					else:
+						# Ensure output is on the correct device
+						output = output.to(self.args.device)
 
 				# Forward pass
-				with torch.no_grad():
-					output, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr)
+				if not cache_hit:
+					with torch.no_grad():
+						output, hid_g = model(decomp_x, decomp_edge_index, decomp_edge_attr)
+					
+					# Save to cache if enabled
+					if self.cache_enabled and query_hash is not None:
+						self.query_cache[query_hash] = output.detach().cpu()
 
 				# Flatten outputs and targets for unified processing
 				output_flat = output.view(-1)
