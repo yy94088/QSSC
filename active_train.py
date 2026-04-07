@@ -252,7 +252,7 @@ if __name__ == "__main__":
 	parser.add_argument("--model_save_dir", type=str, default="./models")
 
 	# Other parameters
-	parser.add_argument('--k', type=int, default=3,
+	parser.add_argument('--k', type=int, default=1,
 						help='decompose hop number.')
 	parser.add_argument("--verbose", default=True, type=bool)
 	parser.add_argument("--mode", default="cross_val", type=str,

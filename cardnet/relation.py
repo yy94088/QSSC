@@ -14,21 +14,32 @@ class SubgraphRelationNet(nn.Module):
     between subgraphs, allowing the model to understand how different parts
     of the query graph relate to each other.
     """
-    def __init__(self, input_dim, hidden_dim=128, num_heads=4, dropout=0.1):
+    def __init__(self, input_dim, hidden_dim=128, num_heads=4, dropout=0.1, use_structure_bias=True, max_dist=20):
         """
         Args:
             input_dim (int): Dimension of subgraph embeddings
             hidden_dim (int): Hidden dimension for relation modeling
             num_heads (int): Number of attention heads
             dropout (float): Dropout rate
+            use_structure_bias (bool): Whether to use structural bias (shortest path distance)
+            max_dist (int): Maximum distance to encode for structural bias
         """
         super(SubgraphRelationNet, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
+        self.use_structure_bias = use_structure_bias
         
         # Project input embeddings to hidden dimension
         self.input_projection = nn.Linear(input_dim, hidden_dim)
+        
+        # Structural Bias Embedding
+        if self.use_structure_bias:
+            # Encode distances [0, max_dist] into bias values for each head
+            # Shape: [max_dist + 1, num_heads]
+            self.dist_embedding = nn.Embedding(max_dist + 1, num_heads)
+            # Initialize with small values
+            nn.init.normal_(self.dist_embedding.weight, mean=0.0, std=0.1)
         
         # Multi-head self-attention for subgraph interactions
         self.attention = nn.MultiheadAttention(
@@ -56,11 +67,14 @@ class SubgraphRelationNet(nn.Module):
         # Output projection back to input dimension
         self.output_projection = nn.Linear(hidden_dim, input_dim)
     
-    def forward(self, subgraph_embeddings):
+    def forward(self, subgraph_embeddings, subgraph_distances=None):
         """
         Args:
             subgraph_embeddings (Tensor): [num_subgraphs, embedding_dim]
                 Embeddings of decomposed subgraphs
+            subgraph_distances (Tensor, optional): [num_subgraphs, num_subgraphs]
+                Pairwise shortest path distances between subgraphs.
+                Used to compute structural bias for attention.
         
         Returns:
             relation_enhanced (Tensor): [num_subgraphs, embedding_dim]
@@ -71,19 +85,36 @@ class SubgraphRelationNet(nn.Module):
         # Handle single subgraph case
         if subgraph_embeddings.dim() == 1:
             subgraph_embeddings = subgraph_embeddings.unsqueeze(0)
-        
+
         num_subgraphs = subgraph_embeddings.size(0)
-        
+
         # Project to hidden dimension
-        x = self.input_projection(subgraph_embeddings)  # [num_subgraphs, hidden_dim]
-        
+        # x shape: [num_subgraphs, hidden_dim]
+        x = self.input_projection(subgraph_embeddings)
+
         # Add batch dimension for attention (batch_first=True)
-        x = x.unsqueeze(0)  # [1, num_subgraphs, hidden_dim]
+        # x shape: [1, num_subgraphs, hidden_dim]
+        x = x.unsqueeze(0)
+
+        attn_mask = None
+        if self.use_structure_bias and subgraph_distances is not None:
+            # subgraph_distances: [num_subgraphs, num_subgraphs]
+            # map distances to bias values: [num_subgraphs, num_subgraphs, num_heads]
+            distances = subgraph_distances.long()
+            # Clamp distances to valid range of embedding
+            distances = torch.clamp(distances, max=self.dist_embedding.num_embeddings - 1)
+            bias = self.dist_embedding(distances)
+            
+            # Reorder for MultiheadAttention mask: [Batch*Num_Heads, Seq_Len, Seq_Len]
+            # Since batch_size=1, shape should be [Num_Heads, N, N]
+            bias = bias.permute(2, 0, 1)  # [Num_Heads, N, N]
+            attn_mask = bias
         
         # Self-attention to capture subgraph relationships
         # Each subgraph attends to all other subgraphs
-        attn_output, attn_weights = self.attention(x, x, x)
-        
+        # attn_mask applies additive mask to attention scores
+        attn_output, attn_weights = self.attention(x, x, x, attn_mask=attn_mask)
+
         # Residual connection + layer norm
         x = self.norm1(x + self.dropout(attn_output))
         
