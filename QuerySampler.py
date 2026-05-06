@@ -10,53 +10,75 @@ import psutil
 from tqdm import tqdm
 
 
+def serialize_query_graph(query):
+	"""Serialize original query graph to JSON-friendly structure."""
+	nodes = []
+	for nid, attrs in query.nodes(data=True):
+		labels = attrs.get("labels", [])
+		nodes.append({"id": int(nid), "labels": [int(x) for x in labels]})
+
+	edges = []
+	for src, dst, attrs in query.edges(data=True):
+		labels = attrs.get("labels", [])
+		edges.append({"src": int(src), "dst": int(dst), "labels": [int(x) for x in labels]})
+
+	return {
+		"num_nodes": int(query.number_of_nodes()),
+		"num_edges": int(query.number_of_edges()),
+		"nodes": nodes,
+		"edges": edges,
+	}
+
+
 def process_single_query_parallel(args_tuple):
-    """
-    并行处理单个查询的函数
-    """
-    (query_load_path, card_load_path, data_graph_path, 
-     queryset_load_path, true_card_load_path, pattern, size, idx, 
-     edge_embeds, edge_index_map, upper_card, lower_card, dataset) = args_tuple
-    
-    try:
-        # 用dataset参数初始化QueryDecompose，确保加载正确的edge_embeds
-        temp_qd = QueryDecompose(
-            queryset_dir=queryset_load_path.replace(f"/{dataset}", ""),
-            true_card_dir=true_card_load_path.replace(f"/{dataset}", ""),
-            dataset=dataset,
-            pattern='query',  # Fixed to 'query'
-            k=3,
-            size=size
-        )
-        temp_qd.edge_embeds = edge_embeds
-        temp_qd.edge_index_map = edge_index_map
-        temp_qd.upper_card = upper_card
-        temp_qd.lower_card = lower_card
-        
-        # 加载查询
-        query, label_den = temp_qd.load_query(query_load_path)
-        graphs = temp_qd.decompose(query)
-        true_card, soft_card = temp_qd.load_card(card_load_path)
-        
-        if true_card >= upper_card or true_card < lower_card:
-            return None
-        
-        true_card = true_card + 1 if true_card == 0 else true_card
-        
-        return {
-            'idx': idx,
-            'query': query,
-            'graphs': graphs,
-            'true_card': true_card,
-            'soft_card': soft_card,
-            'label_den': label_den,
-            'query_id': (pattern, size, idx),
-            'file_name': os.path.basename(query_load_path)
-        }
-        
-    except Exception as e:
-        print(f"Error processing query {query_load_path}: {str(e)}")
-        return None
+	"""
+	并行处理单个查询的函数
+	"""
+	(query_load_path, card_load_path, data_graph_path, queryset_load_path, true_card_load_path, pattern, size, idx,edge_embeds, edge_index_map, upper_card, lower_card, dataset) = args_tuple
+
+	try:
+		# 用 dataset 参数初始化 QueryDecompose
+		temp_qd = QueryDecompose(
+			queryset_dir=queryset_load_path.replace(f"/{dataset}", ""),
+			true_card_dir=true_card_load_path.replace(f"/{dataset}", ""),
+			dataset=dataset,
+			pattern='query',  # Fixed to 'query'
+			k=3,
+			size=size
+		)
+		temp_qd.edge_embeds = edge_embeds
+		temp_qd.edge_index_map = edge_index_map
+		temp_qd.upper_card = upper_card
+		temp_qd.lower_card = lower_card
+
+		# 加载查询
+		query, label_den = temp_qd.load_query(query_load_path)
+		graphs, subgraph_distances = temp_qd.decompose(query)
+		true_card, soft_card = temp_qd.load_card(card_load_path)
+
+		if true_card >= upper_card or true_card < lower_card:
+			return None
+
+		true_card = true_card + 1 if true_card == 0 else true_card
+
+		return {
+			'idx': idx,
+			'query': query,
+			'graphs': graphs,
+			'subgraph_distances': subgraph_distances,
+			'true_card': true_card,
+			'soft_card': soft_card,
+			'label_den': label_den,
+			'query_id': (pattern, size, idx),
+			'file_name': os.path.basename(query_load_path),
+			'query_load_path': query_load_path,
+			'card_load_path': card_load_path,
+			'query_graph': serialize_query_graph(query),
+		}
+
+	except Exception as e:
+		print(f"Error processing query {query_load_path}: {str(e)}")
+		return None
 
 
 class QueryDecompose(object):
@@ -88,6 +110,31 @@ class QueryDecompose(object):
 		self.lower_card = 10 ** 0
 		self.upper_card = 10 ** 20
 
+	def _resolve_size_dirs(self):
+		"""Return a list of (size, query_dir, card_dir) to process."""
+		size_dirs = []
+		if self.size == -1:
+			for entry in sorted(os.listdir(self.queryset_load_path)):
+				query_dir = os.path.join(self.queryset_load_path, entry)
+				if not os.path.isdir(query_dir):
+					continue
+				prefix = self.pattern + '_'
+				if not entry.startswith(prefix):
+					continue
+				try:
+					size_val = int(entry[len(prefix):])
+				except ValueError:
+					continue
+				card_dir = os.path.join(self.true_card_load_path, entry)
+				if os.path.isdir(card_dir):
+					size_dirs.append((size_val, query_dir, card_dir))
+		else:
+			dir_name = self.pattern + '_' + str(self.size)
+			query_dir = os.path.join(self.queryset_load_path, dir_name)
+			card_dir = os.path.join(self.true_card_load_path, dir_name)
+			size_dirs.append((self.size, query_dir, card_dir))
+		return size_dirs
+
 	def decompose_queries_parallel(self, num_workers=None):
 		"""
 		并行版本的查询分解方法
@@ -109,29 +156,35 @@ class QueryDecompose(object):
 		else:
 			print("CUDA not available, using CPU")
 		
-		queries_dir = os.path.join(self.queryset_load_path, self.pattern+'_'+str(self.size))
-		self.all_subsets[(self.pattern, self.size)] = []
-		self.all_queries[(self.pattern, self.size)] = []
+		size_dirs = self._resolve_size_dirs()
+		for size_val, _, _ in size_dirs:
+			self.all_subsets[(self.pattern, size_val)] = []
+			self.all_queries[(self.pattern, size_val)] = []
 		
 		# 准备并行处理的参数
 		query_files = []
-		for idx, query_dir in enumerate(os.listdir(queries_dir)):
-			query_load_path = os.path.join(self.queryset_load_path, self.pattern+'_'+str(self.size), query_dir)
-			card_load_path = os.path.join(self.true_card_load_path, self.pattern+'_'+str(self.size), query_dir)
-			
-			if not os.path.isfile(query_load_path) or os.path.splitext(query_load_path)[1] == ".pickle":
+		for size_val, queries_dir, cards_dir in size_dirs:
+			if not os.path.isdir(queries_dir) or not os.path.isdir(cards_dir):
 				continue
-			
-			query_files.append((query_load_path, card_load_path, idx))
+			for idx, query_dir in enumerate(os.listdir(queries_dir)):
+				query_load_path = os.path.join(queries_dir, query_dir)
+				card_load_path = os.path.join(cards_dir, query_dir)
+				
+				if not os.path.isfile(query_load_path) or os.path.splitext(query_load_path)[1] == ".pickle":
+					continue
+				if not os.path.isfile(card_load_path):
+					continue
+				
+				query_files.append((query_load_path, card_load_path, idx, size_val))
 		
 		print(f"Found {len(query_files)} query files to process")
 		
 		# 准备并行处理的参数
 		args_list = []
-		for query_load_path, card_load_path, idx in query_files:
+		for query_load_path, card_load_path, idx, size_val in query_files:
 			args_tuple = (
 				query_load_path, card_load_path, self.data_graph_path, self.queryset_load_path, 
-				self.true_card_load_path, self.pattern, self.size, idx,
+				self.true_card_load_path, self.pattern, size_val, idx,
 				self.edge_embeds, self.edge_index_map, self.upper_card, self.lower_card, self.dataset
 			)
 			args_list.append(args_tuple)
@@ -154,19 +207,30 @@ class QueryDecompose(object):
 			idx = result['idx']
 			query = result['query']
 			graphs = result['graphs']
+			subgraph_distances = result['subgraph_distances']
 			true_card = result['true_card']
 			soft_card = result['soft_card']
 			label_den = result['label_den']
 			query_id = result['query_id']
+			size_val = query_id[1]
 			file_name = result.get('file_name', f"{query_id[0]}_{query_id[1]}_{idx}")
+			query_meta = {
+				"pattern": str(query_id[0]),
+				"size": int(query_id[1]),
+				"local_idx": int(idx),
+				"file_name": file_name,
+				"query_load_path": result.get('query_load_path', ''),
+				"card_load_path": result.get('card_load_path', ''),
+				"query_graph": result.get('query_graph', None),
+			}
 			
 			avg_label_den += label_den
 			
-			self.all_subsets[(self.pattern, self.size)].append((graphs, true_card, soft_card))
-			self.all_queries[(self.pattern, self.size)].append((query, true_card, soft_card))
+			self.all_subsets[(self.pattern, size_val)].append((graphs, subgraph_distances, true_card, soft_card, query_meta))
+			self.all_queries[(self.pattern, size_val)].append((query, true_card, soft_card))
 			
-			self.query_indices[(self.pattern, self.size, idx)] = query
-			self.query_file_names[(self.pattern, self.size, idx)] = file_name
+			self.query_indices[(self.pattern, size_val, idx)] = query
+			self.query_file_names[(self.pattern, size_val, idx)] = file_name
 			self.num_queries += 1
 		
 		end_time = time.time()
@@ -184,30 +248,44 @@ class QueryDecompose(object):
 
 	def decompose_queries(self):
 		avg_label_den = 0.0
-		queries_dir = os.path.join(self.queryset_load_path, self.pattern+'_'+str(self.size))
-		self.all_subsets[(self.pattern, self.size)] = []
-		self.all_queries[(self.pattern, self.size)] = []
-		for idx, query_dir in enumerate(os.listdir(queries_dir)):
-			query_load_path = os.path.join(self.queryset_load_path, self.pattern+'_'+str(self.size), query_dir)
-			card_load_path = os.path.join(self.true_card_load_path, self.pattern+'_'+str(self.size), query_dir)
-			if not os.path.isfile(query_load_path) or os.path.splitext(query_load_path)[1] == ".pickle":
+		size_dirs = self._resolve_size_dirs()
+		for size_val, queries_dir, cards_dir in size_dirs:
+			if not os.path.isdir(queries_dir) or not os.path.isdir(cards_dir):
 				continue
-			# load, decompose the query
-			query, label_den = self.load_query(query_load_path)
-			avg_label_den += label_den
-			graphs = self.decompose(query)
-			true_card, soft_card = self.load_card(card_load_path)
-			if true_card >=  self.upper_card or true_card < self.lower_card:
-				continue
-			true_card = true_card + 1 if true_card == 0 else true_card
-			
-			query_id = (self.pattern, self.size, idx)
-			self.all_subsets[(self.pattern, self.size)].append((graphs, true_card, soft_card))
-			self.all_queries[(self.pattern, self.size)].append((query, true_card, soft_card))
-			
-			self.query_indices[(self.pattern, self.size, idx)] = query
-			self.query_file_names[(self.pattern, self.size, idx)] = query_dir
-			self.num_queries += 1
+			self.all_subsets[(self.pattern, size_val)] = []
+			self.all_queries[(self.pattern, size_val)] = []
+			for idx, query_dir in enumerate(os.listdir(queries_dir)):
+				query_load_path = os.path.join(queries_dir, query_dir)
+				card_load_path = os.path.join(cards_dir, query_dir)
+				if not os.path.isfile(query_load_path) or os.path.splitext(query_load_path)[1] == ".pickle":
+					continue
+				if not os.path.isfile(card_load_path):
+					continue
+				# load, decompose the query
+				query, label_den = self.load_query(query_load_path)
+				avg_label_den += label_den
+				graphs, subgraph_distances = self.decompose(query)
+				true_card, soft_card = self.load_card(card_load_path)
+				if true_card >=  self.upper_card or true_card < self.lower_card:
+					continue
+				true_card = true_card + 1 if true_card == 0 else true_card
+				
+				query_id = (self.pattern, size_val, idx)
+				query_meta = {
+					"pattern": str(self.pattern),
+					"size": int(size_val),
+					"local_idx": int(idx),
+					"file_name": query_dir,
+					"query_load_path": query_load_path,
+					"card_load_path": card_load_path,
+					"query_graph": serialize_query_graph(query),
+				}
+				self.all_subsets[(self.pattern, size_val)].append((graphs, subgraph_distances, true_card, soft_card, query_meta))
+				self.all_queries[(self.pattern, size_val)].append((query, true_card, soft_card))
+				
+				self.query_indices[(self.pattern, size_val, idx)] = query
+				self.query_file_names[(self.pattern, size_val, idx)] = query_dir
+				self.num_queries += 1
 		
 		print("num_queries", self.num_queries)
 		
@@ -219,10 +297,30 @@ class QueryDecompose(object):
 
 	def decompose(self, query):
 		graphs = []
-		for src in query.nodes():
+		node_order = list(query.nodes())
+		for src in node_order:
 			G = self.k_hop_induced_subgraph(query, src)
 			graphs.append(G)
-		return graphs
+
+		# Build subgraph-to-subgraph shortest-path distances on the original query graph.
+		# The i-th subgraph is centered at node_order[i].
+		subgraph_distances = self.compute_subgraph_distances(query, node_order)
+		return graphs, subgraph_distances
+
+	def compute_subgraph_distances(self, query, node_order):
+		num_nodes = len(node_order)
+		distances = np.zeros((num_nodes, num_nodes), dtype=np.int64)
+		all_pairs = dict(nx.all_pairs_shortest_path_length(query))
+
+		for i, src in enumerate(node_order):
+			src_dists = all_pairs.get(src, {})
+			for j, dst in enumerate(node_order):
+				if i == j:
+					continue
+				# Use a large finite distance for disconnected pairs to keep tensors numeric.
+				distances[i, j] = int(src_dists.get(dst, num_nodes))
+
+		return distances
 
 	def k_hop_induced_subgraph(self, query, src):
 		nodes_list = [src]

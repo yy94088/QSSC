@@ -28,7 +28,8 @@ def main(args):
 
 
 
-	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern='query', k=args.k, size=args.size)
+	decompose_size = -1 if args.all_sizes else args.size
+	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern='query', k=args.k, size=decompose_size)
 	# decompose the query
 	if args.use_parallel:
 		print(f"Using parallel processing for query decomposition with {args.num_workers} workers...")
@@ -46,7 +47,12 @@ def main(args):
 
 	train_sets, val_sets, test_sets, all_train_sets = QS.train_sets, QS.val_sets, QS.test_sets, QS.all_train_sets
 	train_datasets = _to_datasets(train_sets) if args.cumulative else _to_datasets(all_train_sets)
-	val_datasets, test_datasets = _to_datasets(val_sets), _to_datasets(test_sets)
+	if args.all_sizes:
+		merged_val_sets = [query for subset in val_sets for query in subset]
+		merged_test_sets = [query for subset in test_sets for query in subset]
+		val_datasets, test_datasets = _to_datasets([merged_val_sets]), _to_datasets([merged_test_sets])
+	else:
+		val_datasets, test_datasets = _to_datasets(val_sets), _to_datasets(test_sets)
 
 	# Create model
 	model = cardnet.CardNet(
@@ -62,6 +68,7 @@ def main(args):
 	scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_factor)
 
 	active_learner = ActiveLearner(args, QD=QD)
+	active_learner.set_run_mode(args.mode)
 	
 	if args.mode == "train":
 		print("Starting training...")
@@ -93,7 +100,8 @@ def cross_validate(args):
 	weight_decay = args.weight_decay
 	decay_factor = args.decay_factor
 
-	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern='query', k=args.k, size=args.size)
+	decompose_size = -1 if args.all_sizes else args.size
+	QD = QueryDecompose(queryset_dir=queryset_dir, true_card_dir=true_card_dir, dataset=dataset, pattern='query', k=args.k, size=decompose_size)
 	if args.use_parallel:
 		print(f"Using parallel processing for query decomposition with {args.num_workers} workers...")
 		QD.decompose_queries_parallel(num_workers=args.num_workers)
@@ -111,13 +119,18 @@ def cross_validate(args):
 
 	criterion = torch.nn.MSELoss()
 	active_learner = ActiveLearner(args, QD=QD)
+	active_learner.set_run_mode("cross_val")
 	all_fold_val_res = None
 	i = 0
 	total_elapse_time = 0.0
 	for train_sets, val_sets in zip(all_fold_train_sets, all_fold_val_sets):
 		i += 1
 		print("start the {}/{} fold training ...".format(i, args.num_fold))
-		train_datasets, val_datasets = _to_datasets([train_sets]), _to_datasets(val_sets)
+		if args.all_sizes:
+			merged_val_sets = [query for subset in val_sets for query in subset]
+			train_datasets, val_datasets = _to_datasets([train_sets]), _to_datasets([merged_val_sets])
+		else:
+			train_datasets, val_datasets = _to_datasets([train_sets]), _to_datasets(val_sets)
 		
 		model = cardnet.CardNet(
 			args, 
@@ -150,8 +163,9 @@ def cross_validate(args):
 	print("error_median={}".format(0 - error_median))
 	
 	# 添加save_eval_res函数的定义
-	from active.active_util import save_eval_res
-	save_eval_res(args, sorted(all_sizes.keys()), all_fold_val_res, args.save_res_dir)
+	if not args.all_sizes:
+		from active.active_util import save_eval_res
+		save_eval_res(args, sorted(all_sizes.keys()), all_fold_val_res, args.save_res_dir)
 
 
 if __name__ == "__main__":
@@ -208,6 +222,14 @@ if __name__ == "__main__":
 						help='Temperature for softening predictions in distillation')
 	parser.add_argument('--confidence_threshold', type=float, default=1.0,
 						help='Quality threshold for soft labels (in log space)')
+	parser.add_argument('--distill_warmup_epochs', type=int, default=5,
+						help='Epochs to train with hard labels only before enabling distillation')
+	parser.add_argument('--distill_ramp_epochs', type=int, default=10,
+						help='Epochs to linearly ramp distillation strength after warmup')
+	parser.add_argument('--distill_min_quality', type=float, default=0.0,
+						help='Lower bound for per-sample soft-label quality weight (0~1)')
+	parser.add_argument('--distill_hard_only_quality_threshold', type=float, default=0.2,
+						help='Fallback to hard-only loss when batch average soft-label quality is below this value')
 	
 	# ===== Subgraph Relation Network Settings =====
 	parser.add_argument('--use_subgraph_relation', action='store_true',
@@ -239,10 +261,28 @@ if __name__ == "__main__":
 						help='Disables CUDA training.')
 	parser.add_argument('--num_workers', type=int, default=8,
 						help='Number of worker processes for parallel processing and Dataset workers')
+	parser.add_argument('--record_high_qerror', action='store_true',
+						help='Record query graphs with large q_error during evaluation')
+	parser.add_argument('--qerror_record_threshold', type=float, default=10.0,
+						help='Only record samples with q_error >= threshold')
+	parser.add_argument('--high_qerror_topk', type=int, default=200,
+						help='Max number of high-q_error samples to keep per evaluation pass')
+	parser.add_argument('--high_qerror_save_path', type=str, default='',
+						help='Optional explicit path to save high-q_error records (jsonl)')
+	parser.add_argument('--append_high_qerror_log', action='store_true', default=True,
+						help='Append high-q_error records to existing log file (default: True)')
+	parser.add_argument('--no_append_high_qerror_log', action='store_false', dest='append_high_qerror_log',
+						help='Overwrite high-q_error log file instead of appending')
+	parser.add_argument('--large_query_size_threshold', type=int, default=12,
+						help='Heuristic threshold for tagging large query size in error analysis')
+	parser.add_argument('--complex_subgraph_threshold', type=int, default=8,
+						help='Heuristic threshold for tagging many decomposed subgraphs')
 	
 	
 	parser.add_argument("--size", type=int, default=8,
 						help="Query graph size")
+	parser.add_argument('--all_sizes', action='store_true',
+						help='Load all query_* sizes together for joint training/evaluation')
 	
 	# Input and Output directory
 	parser.add_argument("--dataset", type=str, default="dblp")  # aids, wordnet, yeast, hprd, youtube, eu2005 are tested

@@ -48,28 +48,57 @@ class AdaptiveWeightedMSELoss(nn.Module):
 
 class DistillationLoss(nn.Module):
 
-    def __init__(self, alpha=0.5, temperature=2.0, confidence_threshold=1.0):
+    def __init__(
+        self,
+        alpha=0.5,
+        temperature=2.0,
+        confidence_threshold=1.0,
+        min_quality=0.0,
+        hard_only_quality_threshold=0.2,
+    ):
 
         super(DistillationLoss, self).__init__()
         self.alpha = alpha
         self.temperature = temperature
         self.confidence_threshold = confidence_threshold
+        self.min_quality = min_quality
+        self.hard_only_quality_threshold = hard_only_quality_threshold
         self.epsilon = 1e-8
     
-    def forward(self, student_pred, soft_label, hard_label):
+    def forward(self, student_pred, soft_label, hard_label, alpha_scale=1.0):
 
+        student_pred = student_pred.view(-1)
+        hard_label = hard_label.view(-1)
         hard_loss = F.mse_loss(student_pred, hard_label)
 
         if soft_label is None or torch.isnan(soft_label).any():
             return hard_loss, torch.ones_like(hard_label)
 
+        soft_label = soft_label.view(-1)
+        valid_mask = torch.isfinite(student_pred) & torch.isfinite(hard_label) & torch.isfinite(soft_label)
+        if valid_mask.sum().item() == 0:
+            return hard_loss, torch.zeros_like(hard_label)
+
+        student_pred = student_pred[valid_mask]
+        hard_label = hard_label[valid_mask]
+        soft_label = soft_label[valid_mask]
+
         soft_label_error = torch.abs(soft_label - hard_label)
 
         quality_weights = torch.sigmoid((self.confidence_threshold - soft_label_error) / self.temperature)
+        quality_weights = torch.clamp(quality_weights, min=self.min_quality, max=1.0)
 
-        soft_loss = F.mse_loss(student_pred / self.temperature, soft_label / self.temperature)
+        scaled_student = student_pred / self.temperature
+        scaled_soft = soft_label / self.temperature
+        soft_mse = (scaled_student - scaled_soft) ** 2
+        weight_sum = torch.clamp(quality_weights.sum(), min=self.epsilon)
+        soft_loss = (soft_mse * quality_weights).sum() / weight_sum
 
-        adaptive_alpha = self.alpha * quality_weights.mean()
+        avg_quality = quality_weights.mean()
+        adaptive_alpha = self.alpha * float(alpha_scale) * avg_quality
+        if avg_quality.item() < self.hard_only_quality_threshold:
+            adaptive_alpha = adaptive_alpha * 0.0
+
         total_loss = (1 - adaptive_alpha) * hard_loss + adaptive_alpha * soft_loss * (self.temperature ** 2)
         
         return total_loss, quality_weights

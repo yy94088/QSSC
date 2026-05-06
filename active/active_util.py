@@ -86,17 +86,32 @@ def print_eval_res(all_eval_res, print_details= True):
 	total_loss, total_l1 = 0.0, 0.0
 	all_errors = []
 	all_teacher_errors = []  # 用于存储教师模型的误差
+	log10_2 = math.log10(2.0)
 	for i, (res, loss, l1, elapse_time) in enumerate(all_eval_res):
 		print("Evaluation result of {}-th Eval set: Loss= {:.4f}, Avg. L1 Loss= {:.4f}, Avg. Pred. Time= {:.9f}(s)"
 			  .format(i, loss, l1/len(res), elapse_time/len(res)))
-		# Q-error without absolute value: positive = overestimate, negative = underestimate
-		errors = [ output - card for card, output, soft_card in res]
-		teacher_errors = [ soft_card - card for card, output, soft_card in res if not (np.isnan(soft_card) or np.isinf(soft_card))]  # 过滤NaN和无穷大值
-		get_prediction_statistics(errors, "Student Model Q-Error (pred-true, +overest/-underest)")
+		# Convert log2 predictions to signed log10(q_error): sign keeps over/under direction.
+		errors = [(output - card) * log10_2 for card, output, soft_card, *_ in res]
+		teacher_errors = [(soft_card - card) * log10_2 for card, output, soft_card, *_ in res
+						  if not (np.isnan(soft_card) or np.isinf(soft_card))]  # 过滤NaN和无穷大值
+		get_prediction_statistics(errors, "Student signed log10(Q-Error) (+overest/-underest)")
 		
 		# 添加教师模型的统计信息
 		if teacher_errors:
-			get_prediction_statistics(teacher_errors, "Teacher Model Q-Error (pred-true, +overest/-underest)")
+			get_prediction_statistics(teacher_errors, "Teacher signed log10(Q-Error) (+overest/-underest)")
+
+		# Optional per-size breakdown when size info is attached.
+		size_groups = {}
+		for item in res:
+			if len(item) >= 4:
+				s = int(item[3])
+				size_groups.setdefault(s, []).append(item)
+		if len(size_groups) > 1:
+			print("Per-size signed log10(Q-Error):")
+			for s in sorted(size_groups.keys()):
+				size_errors = [(output - card) * log10_2 for card, output, soft_card, *_ in size_groups[s]]
+				print("  size {}: n={}".format(s, len(size_errors)))
+				get_prediction_statistics(size_errors, "Size {} Student signed log10(Q-Error)".format(s))
 		
 		all_errors += errors
 		if teacher_errors:
@@ -106,20 +121,20 @@ def print_eval_res(all_eval_res, print_details= True):
 		if print_details:
 			print("Detailed Prediction Results:")
 			print("{:<10} {:<15} {:<15} {:<20} {:<12} {:<15} {:<20}".format(
-				"Sample ID", "true(log)", "pred(log)", "teacher_pred(log)", "MSE Loss", "Q-Error(p-t)", "Teacher Q-Error(p-t)"))
+				"Sample ID", "true(log2)", "pred(log2)", "teacher_pred(log2)", "MSE Loss", "log10(QE)", "Teacher log10(QE)"))
 			print("-" * 120)
-			for idx, (card, output, soft_card) in enumerate(res):
+			for idx, (card, output, soft_card, *_) in enumerate(res):
 				mse_loss = (card - output) ** 2
-				q_error = output - card  # Positive = overestimate, Negative = underestimate
-				teacher_q_error = soft_card - card if not (np.isnan(soft_card) or np.isinf(soft_card)) else float('nan')
+				q_error = (output - card) * log10_2
+				teacher_q_error = (soft_card - card) * log10_2 if not (np.isnan(soft_card) or np.isinf(soft_card)) else float('nan')
 				print("{:<10} {:<15.4f} {:<15.4f} {:<20.4f} {:<12.4f} {:<15.4f} {:<20.4f}".format(
 					idx, card, output, soft_card, mse_loss, q_error, teacher_q_error))
 	print("Evaluation result of Eval dataset: Total Loss= {:.4f}, Total L1 Loss= {:.4f}".format(total_loss, total_l1))
-	get_prediction_statistics(all_errors, "Overall Student Q-Error (pred-true, +overest/-underest)")
+	get_prediction_statistics(all_errors, "Overall Student signed log10(Q-Error) (+overest/-underest)")
 	
 	# 添加教师模型的整体统计信息
 	if all_teacher_errors:
-		get_prediction_statistics(all_teacher_errors, "Overall Teacher Q-Error (pred-true, +overest/-underest)")
+		get_prediction_statistics(all_teacher_errors, "Overall Teacher signed log10(Q-Error) (+overest/-underest)")
 	
 	# 计算并返回中位数误差（使用绝对值计算，用于比较）
 	error_median = np.median([abs(e) for e in all_errors]) if all_errors else 0
@@ -137,7 +152,7 @@ def save_eval_res(args, sizes, all_eval_res, save_res_dir):
 			writer.writerow(header)
 		for size, eval_res in zip(sizes, all_eval_res):
 			res = eval_res[0]
-			for card, output,soft_card in res:
+			for card, output, soft_card, *_ in res:
 				error = abs(output - card)
 				#label = math.ceil(math.log10(math.pow(card, 2) + 10 ** (-8)))
 				writer.writerow(["CardNet", size, math.pow(2, error), card])

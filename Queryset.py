@@ -68,9 +68,7 @@ class Queryset(object):
 
 		# split to train, val, test query set
 		self.num_train_queries , self.num_val_queries, self.num_test_queries = 0, 0, 0
-		train_sets, val_sets, test_sets, all_train_sets = self.data_split(self.all_sizes, train_ratio= 0.8, val_ratio=0.1)
-		#train_sets, val_sets, test_sets, all_train_sets = self.uneven_data_split(self.all_sizes, train_ratio=0.5,
-		#																  val_ratio=0.4)
+		train_sets, val_sets, test_sets, all_train_sets = self.data_split(self.all_sizes, train_ratio= 0.9, val_ratio=0.05, seed=42)
 
 		self.train_loaders = self.to_dataloader(all_sets= train_sets)
 		self.val_loaders = self.to_dataloader(all_sets= val_sets)
@@ -151,10 +149,29 @@ class Queryset(object):
 		tmp_subsets = {}
 		for (pattern, size), graphs_card_pairs in all_subsets.items():
 			tmp_subsets[(pattern, size)] = []
-			for (graphs, card, soft_card) in graphs_card_pairs:
+			for graph_item in graphs_card_pairs:
+				query_meta = {}
+				if len(graph_item) >= 5:
+					graphs, subgraph_distances, card, soft_card, query_meta = graph_item[:5]
+				elif len(graph_item) == 4:
+					graphs, subgraph_distances, card, soft_card = graph_item
+				else:
+					graphs, card, soft_card = graph_item
+					subgraph_distances = None
 				decomp_x, decomp_edge_index, decomp_edge_attr, _, _ = \
 					self._get_decomposed_graph_data(graphs)
-				tmp_subsets[(pattern, size)].append((decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card))
+				if subgraph_distances is not None:
+					subgraph_distances = torch.tensor(subgraph_distances, dtype=torch.long)
+				tmp_subsets[(pattern, size)].append((
+					decomp_x,
+					decomp_edge_index,
+					decomp_edge_attr,
+					card,
+					soft_card,
+					subgraph_distances,
+					size,
+					query_meta,
+				))
 				self.num_queries += 1
 
 		return tmp_subsets
@@ -327,7 +344,19 @@ class QueryDataset(Dataset):
 		"""
 		decomp_x, decomp_edge_attr, decomp_edge_attr: list[Tensor]
 		"""
-		decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card = self.queries[index]
+		query_item = self.queries[index]
+		query_meta = {}
+		if len(query_item) >= 8:
+			decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card, subgraph_distances, query_size, query_meta = query_item[:8]
+		elif len(query_item) >= 7:
+			decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card, subgraph_distances, query_size = query_item[:7]
+		elif len(query_item) == 6:
+			decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card, subgraph_distances = query_item
+			query_size = len(decomp_x)
+		else:
+			decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card = query_item
+			subgraph_distances = None
+			query_size = len(decomp_x)
 		
 		# 检查card是否有效
 		if card <= 0 or math.isnan(card) or math.isinf(card):
@@ -342,7 +371,13 @@ class QueryDataset(Dataset):
 		else:
 			soft_card = torch.tensor(math.log(soft_card, 2), dtype=torch.float)
 
-		return decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card
+		if subgraph_distances is None:
+			n = len(decomp_x)
+			subgraph_distances = torch.zeros((n, n), dtype=torch.long)
+
+		query_size = torch.tensor(int(query_size), dtype=torch.long)
+
+		return decomp_x, decomp_edge_index, decomp_edge_attr, card, soft_card, subgraph_distances, query_size, query_meta
 
 
 

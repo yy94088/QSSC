@@ -65,7 +65,7 @@ class CardNet(nn.Module):
         elif isinstance(module, nn.Parameter):
             nn.init.uniform_(module, -0.1, 0.1)
 
-    def forward(self, decomp_x, decomp_edge_index, decomp_edge_attr):
+    def forward(self, decomp_x, decomp_edge_index, decomp_edge_attr, subgraph_distances=None):
         """
         Forward pass for cardinality estimation.
         
@@ -73,6 +73,8 @@ class CardNet(nn.Module):
             decomp_x: List of node feature tensors for decomposed subgraphs
             decomp_edge_index: List of edge index tensors
             decomp_edge_attr: List of edge attribute tensors
+            subgraph_distances: Optional pairwise shortest-path distance matrix
+                between decomposed subgraphs, shape [N, N] or [1, N, N]
         
         Returns:
             output: Predicted log cardinality
@@ -87,7 +89,11 @@ class CardNet(nn.Module):
             # Apply relation network to enhance subgraph embeddings
             if subgraph_embeds is not None and subgraph_embeds.size(0) > 1:
                 if isinstance(self.relation_net, SubgraphRelationNet):
-                    enhanced_embeds, _ = self.relation_net(subgraph_embeds)
+                    if subgraph_distances is not None and isinstance(subgraph_distances, torch.Tensor):
+                        if subgraph_distances.dim() == 3 and subgraph_distances.size(0) == 1:
+                            subgraph_distances = subgraph_distances.squeeze(0)
+                        subgraph_distances = subgraph_distances.to(subgraph_embeds.device)
+                    enhanced_embeds, _ = self.relation_net(subgraph_embeds, subgraph_distances=subgraph_distances)
                 else:  # GraphBasedRelationNet
                     enhanced_embeds = self.relation_net(subgraph_embeds)
                 
